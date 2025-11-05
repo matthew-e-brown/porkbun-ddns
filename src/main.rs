@@ -2,7 +2,7 @@ mod api;
 mod config;
 
 use std::collections::BTreeMap;
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use futures::future;
 use serde_json::{Map as JsonMap, Value as JsonValue};
@@ -72,36 +72,40 @@ async fn get_addresses(
 ) -> anyhow::Result<(Option<Ipv4Addr>, Option<Ipv6Addr>)> {
     println!("Fetching current IP address...");
 
-    let ipv4_fut = async {
-        if config.ipv4 {
-            Ok(Some(porkbun.get_ipv4().await?))
-        } else {
-            Ok(None)
-        }
-    };
+    let mut ipv4 = None;
+    let mut ipv6 = None;
 
-    let ipv6_fut = async {
-        if config.ipv6 {
-            match porkbun.get_ipv6().await? {
-                None if config.ipv6_error => anyhow::bail!("Failed to retrieve IPv6 address from Porkbun"),
-                other => Ok(other),
+    // Ping the base `/ping` endpoint to see which type of IP address we get
+    match porkbun.ping().await? {
+        // If the non-IPv4 endpoint gives us IPv4, we don't have IPv6.
+        IpAddr::V4(addr) => {
+            if config.ipv4 {
+                println!("Got IPv4 address: {addr}");
+                ipv4 = Some(addr);
             }
-        } else {
-            Ok(None)
-        }
+
+            if config.ipv6 {
+                println!("Got IPv6 address: None.");
+                // Do the bail after printing the IPv4 so the user has more info to debug with
+                if config.ipv6_error {
+                    anyhow::bail!("Failed to retrieve IPv6 address from Porkbun");
+                }
+            }
+        },
+        IpAddr::V6(addr) => {
+            if config.ipv6 {
+                println!("Got IPv6 address: {addr}");
+                ipv6 = Some(addr)
+            }
+
+            // Only now, if we got an IPv6 address but also want an IPv4 address, do we need the second ping.
+            if config.ipv4 {
+                let addr = porkbun.ping_v4().await?;
+                println!("Got IPv4 address: {addr}");
+                ipv4 = Some(addr);
+            }
+        },
     };
-
-    let (ipv4, ipv6) = future::try_join(ipv4_fut, ipv6_fut).await?;
-
-    if let Some(addr) = ipv4 {
-        println!("Got IPv4 address: {addr}");
-    }
-
-    if let Some(addr) = ipv6 {
-        println!("Got IPv6 address: {addr}");
-    } else if config.ipv6 {
-        println!("Got IPv6 address: None.");
-    }
 
     Ok((ipv4, ipv6))
 }

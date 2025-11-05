@@ -1,4 +1,4 @@
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr};
 
 use anyhow::anyhow;
 use chrono::Local;
@@ -51,23 +51,25 @@ impl PorkbunClient {
         })
     }
 
-    /// Gets this system's current public IPv4 address using Porkbun's `/ping` endpoint.
-    pub async fn get_ipv4(&self) -> anyhow::Result<Ipv4Addr> {
+    /// Determine this system's current public IP address using Porkbun's `/ping` endpoint.
+    ///
+    /// Porkbun may return either an IPv4 or IPv6 address; see [`ping_v4`][Self::ping_v4].
+    pub async fn ping(&self) -> anyhow::Result<IpAddr> {
+        let url = format!("{BASE_URL}/ping");
+        let res = self.request::<Ping>(url, None).await?;
+        Ok(res.your_ip)
+    }
+
+    /// Determine this system's current IPv4 address using Porkbun's `/ping` endpoint on the `api-ipv4.porkbun.com`
+    /// subdomain.
+    pub async fn ping_v4(&self) -> anyhow::Result<Ipv4Addr> {
         let url = format!("{BASE_URL_V4}/ping");
         let res = self.request::<Ping>(url, None).await?;
+        // What happens if a system *only* has IPv6? Will /ping return an error?
+        // ...I don't really have a way to test that.
         match res.your_ip {
             IpAddr::V4(addr) => Ok(addr),
             IpAddr::V6(addr) => Err(anyhow!("IPv4 ping returned IPv6 address: {addr}")),
-        }
-    }
-
-    /// Gets this system's current public IPv6 address using Porkbun's `/ping` endpoint.
-    pub async fn get_ipv6(&self) -> anyhow::Result<Option<Ipv6Addr>> {
-        let url = format!("{BASE_URL}/ping");
-        let res = self.request::<Ping>(url, None).await?;
-        match res.your_ip {
-            IpAddr::V4(_) => Ok(None),
-            IpAddr::V6(addr) => Ok(Some(addr)),
         }
     }
 
