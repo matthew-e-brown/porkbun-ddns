@@ -12,24 +12,55 @@ use crate::api::model::DNSRecord;
 #[rustfmt::skip] const fn bool<const X: bool>() -> bool { X }
 #[rustfmt::skip] const fn empty<T>() -> Vec<T> { Vec::new() }
 
-
+// Internal struct for command-line flags: **not** the main program configuration. The main configuration comes from
+// `Config`, which is loaded from a TOML file.
 #[derive(Debug, clap::Parser)]
 #[command(version, about, max_term_width = 100)]
 struct Args {
-    /// Fetch current IP addresses and determine which records to update, but don't actually update
-    /// anything.
-    #[arg(short = 'n', long)]
-    dry_run: bool,
-
     /// Path to TOML file containing configuration for the domains to update.
     #[arg(
-        short,
-        long,
+        short = 'c',
+        long = "cfg",
         env = "PORKBUN_DDNS_CONFIG",
         value_name = "FILE",
         default_value = "/etc/ddns.toml"
     )]
     cfg: PathBuf,
+
+    /// Skip creating or modifying any DNS records on Porkbun.
+    ///
+    /// When this option is enabled, current IP addresses will be fetched and the records that need to be updated will
+    /// be printed, but no changes will actually be made.
+    #[arg(short = 'n', long)]
+    dry_run: bool,
+
+    /// Update IPv4 (A) records for all domains.
+    ///
+    /// This command-line option force-enables IPv4 updates, regardless of what the 'ipv4' setting in the config file
+    /// says.
+    #[arg(long, conflicts_with = "no_ipv4")]
+    ipv4: bool,
+
+    /// Update IPv6 (AAAA) records for all domains.
+    ///
+    /// This command-line option force-enables IPv6 updates, regardless of what the 'ipv6' setting in the config file
+    /// says.
+    #[arg(long, conflicts_with = "no_ipv6")]
+    ipv6: bool,
+
+    /// Disable the updating of IPv4 (A) records for all domains.
+    ///
+    /// This command-line option force-disables IPv4 updates, regardless of what the 'ipv4' setting in the config file
+    /// says.
+    #[arg(long)]
+    no_ipv4: bool,
+
+    /// Disable the updating of IPv6 (AAAA) records for all domains.
+    ///
+    /// This command-line option force-disables IPv6 updates, regardless of what the 'ipv6' setting in the config file
+    /// says.
+    #[arg(long)]
+    no_ipv6: bool,
 }
 
 /// Main program configuration and job specification.
@@ -48,8 +79,8 @@ pub struct Config {
     pub ipv6: bool,
 
     /// When this option is false (the default), `AAAA` records are updated "if possible:" failure to acquire an IPv6
-    /// address when pinging Porkbun will not cause an error. When this option is true, failure to acquire an IPv6
-    /// address will trigger a fatal error.
+    /// address when pinging Porkbun will not cause an error. When this option is true (and IPv6 is enabled), failure to
+    /// acquire an IPv6 address will trigger a fatal error.
     #[serde(default = "bool::<false>")]
     pub ipv6_error: bool,
 
@@ -63,8 +94,8 @@ impl Config {
     pub async fn init() -> anyhow::Result<Self> {
         let args = Args::parse();
 
-        let text = fs::read_to_string(&args.cfg).await.context("failed to read config file.")?;
-        let mut config: Config = toml::from_str(&text).context("failed to parse config file.")?;
+        let text = fs::read_to_string(&args.cfg).await.context("failed to read config file")?;
+        let mut config: Config = toml::from_str(&text).context("failed to parse config file")?;
 
         config.extend_from_args(&args);
 
@@ -74,6 +105,19 @@ impl Config {
     /// Copies over non-TOML settings from the command line into this [`Config`] struct.
     fn extend_from_args(&mut self, args: &Args) {
         self.dry_run = args.dry_run;
+
+        if args.ipv4 {
+            self.ipv4 = true;
+        } else if args.no_ipv4 {
+            self.ipv4 = false;
+        }
+
+        if args.ipv6 {
+            self.ipv6 = true;
+        } else if args.no_ipv6 {
+            self.ipv6 = false;
+        }
+
         // ...other future settings.
     }
 }
