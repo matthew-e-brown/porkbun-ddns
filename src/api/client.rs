@@ -9,13 +9,13 @@ use serde_json::{Map as JsonMap, Value as JsonValue, json};
 
 use super::AddressType;
 use super::model::{DNSRecord, DNSRecordList, Ping};
-use crate::JsonObjectExt;
 use crate::config::DomainJob;
 
 
 const BASE_URL: &'static str = "https://api.porkbun.com/api/json/v3";
 const BASE_URL_V4: &'static str = "https://api-ipv4.porkbun.com/api/json/v3";
 
+type JsonObject = JsonMap<String, JsonValue>;
 
 /// The access point to the Porkbun API.
 pub struct PorkbunClient {
@@ -150,5 +150,18 @@ impl PorkbunClient {
                 }
             },
         }
+    }
+}
+
+trait JsonObjectExt {
+    /// Combines [`JsonMap::get`] and [`JsonValue::as_str`] into one method that only returns the value if it both
+    /// exists and is a string.
+    fn get_str(&self, key: &str) -> Option<&str>;
+}
+
+impl JsonObjectExt for JsonObject {
+    #[inline]
+    fn get_str(&self, key: &str) -> Option<&str> {
+        self.get(key).and_then(JsonValue::as_str)
     }
 }

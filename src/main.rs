@@ -5,27 +5,10 @@ use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use futures::future;
-use serde_json::{Map as JsonMap, Value as JsonValue};
 
 use self::api::model::DNSRecord;
 use self::api::{AddressType, IPv4, IPv6, PorkbunClient};
 use self::config::Config;
-
-
-type JsonObject = JsonMap<String, JsonValue>;
-
-pub trait JsonObjectExt {
-    /// Combines [`JsonMap::get`] and [`JsonValue::as_str`] into one method that only returns the value if it both
-    /// exists and is a string.
-    fn get_str(&self, key: &str) -> Option<&str>;
-}
-
-impl JsonObjectExt for JsonObject {
-    #[inline]
-    fn get_str(&self, key: &str) -> Option<&str> {
-        self.get(key).and_then(JsonValue::as_str)
-    }
-}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
