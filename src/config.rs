@@ -84,9 +84,9 @@ pub struct Config {
     #[serde(default = "bool::<false>")]
     pub ipv6_error: bool,
 
-    /// A list of domains to update.
+    /// A list of jobs describing domains/subdomains to update.
     #[serde(default = "empty")]
-    pub domains: Vec<DomainJob>,
+    pub targets: Vec<Target>,
 }
 
 impl Config {
@@ -98,7 +98,6 @@ impl Config {
         let mut config: Config = toml::from_str(&text).context("failed to parse config file")?;
 
         config.extend_from_args(&args);
-
         Ok(config)
     }
 
@@ -123,15 +122,15 @@ impl Config {
 }
 
 
-/// Job specification for a single domain or subdomain to update.
+/// Specification for a single domain or subdomain to update.
 #[derive(Debug)]
-pub struct DomainJob {
+pub struct Target {
     domain: String,
     subdomain: Option<String>,
     ttl: u32,
 }
 
-impl DomainJob {
+impl Target {
     pub fn domain(&self) -> &str {
         &self.domain[..]
     }
@@ -154,10 +153,10 @@ impl DomainJob {
     }
 
     /// Checks if this job matches the given DNS record.
-    pub fn check_record(&self, record: &DNSRecord) -> bool {
+    pub fn matches_record(&self, record: &DNSRecord) -> bool {
         match self.subdomain() {
             // '@' as a subdomain refers to the root of the domain; check the whole thing.
-            Some("@") | None => record.name == self.domain,
+            Some("@") | Some("") | None => record.name == self.domain,
             // Could do this by just just allocating "{subdomain}.{domain}" and comparing... but that means allocating!
             Some(sub) => {
                 record.name.starts_with(sub)
@@ -170,14 +169,14 @@ impl DomainJob {
 
     pub fn fmt_name(&self) -> String {
         match self.subdomain() {
-            Some("@") | None => self.domain().to_string(),
+            Some("@") | Some("") | None => self.domain().to_string(),
             Some(sub) => format!("{sub}.{}", self.domain()),
         }
     }
 }
 
-/// [`DomainJob`] can be deserialized either as a single string or as a map of options.
-impl<'de> Deserialize<'de> for DomainJob {
+/// A [`Target`] can be deserialized either as a single string or as a map of options.
+impl<'de> Deserialize<'de> for Target {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
@@ -187,18 +186,18 @@ impl<'de> Deserialize<'de> for DomainJob {
         struct DomainVisitor;
 
         impl<'de> de::Visitor<'de> for DomainVisitor {
-            type Value = DomainJob;
+            type Value = Target;
 
             fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
                 formatter.write_str("string or map")
             }
 
             fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
-                Ok(DomainJob::from_domain(v.to_string()))
+                Ok(Target::from_domain(v.to_string()))
             }
 
             fn visit_string<E: de::Error>(self, v: String) -> Result<Self::Value, E> {
-                Ok(DomainJob::from_domain(v))
+                Ok(Target::from_domain(v))
             }
 
             fn visit_map<A: de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
@@ -218,7 +217,7 @@ impl<'de> Deserialize<'de> for DomainJob {
                 let domain = domain.ok_or_else(|| de::Error::missing_field("domain"))?;
                 let ttl = ttl.unwrap_or(600);
 
-                Ok(DomainJob { domain, subdomain, ttl })
+                Ok(Target { domain, subdomain, ttl })
             }
         }
         // ----------------------------------------------------------------------------------------
