@@ -13,6 +13,11 @@ pub struct Ping {
     pub your_ip: IpAddr,
 }
 
+/// Response returned from the `/create` endpoint.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CreatedRecord {
+    pub id: String,
+}
 
 /// The list of DNS records returned by Porkbun's `/retrieve` endpoint.
 #[derive(Debug, Clone, Deserialize)]
@@ -48,18 +53,19 @@ mod optional_or_stringified_number {
         D::Error: serde::de::Error,
     {
         const EXPECTED: &'static str = "integer, string, or null";
-        match JsonValue::deserialize(d)? {
-            JsonValue::Null => Ok(None),
-            JsonValue::String(str) if str.as_str().trim().is_empty() => Ok(None),
-            JsonValue::String(str) => Ok(Some(str.parse().map_err(D::Error::custom)?)),
-            JsonValue::Number(num) => {
+        match Option::<JsonValue>::deserialize(d)? {
+            None => Ok(None),
+            Some(JsonValue::String(str)) if str.as_str().trim().is_empty() => Ok(None),
+            Some(JsonValue::String(str)) => Ok(Some(str.parse().map_err(D::Error::custom)?)),
+            Some(JsonValue::Number(num)) => {
                 let n = num.as_i64().ok_or_else(|| D::Error::custom("not an integer"))?;
                 let n = u32::try_from(n).map_err(|_| D::Error::custom("integer out of range"))?;
                 Ok(Some(n))
             },
-            JsonValue::Bool(v) => return Err(D::Error::invalid_type(Unexpected::Bool(v), &EXPECTED)),
-            JsonValue::Array(_) => return Err(D::Error::invalid_type(Unexpected::Seq, &EXPECTED)),
-            JsonValue::Object(_) => return Err(D::Error::invalid_type(Unexpected::Map, &EXPECTED)),
+            Some(JsonValue::Null) => return Err(D::Error::invalid_type(Unexpected::Other("null"), &EXPECTED)),
+            Some(JsonValue::Bool(v)) => return Err(D::Error::invalid_type(Unexpected::Bool(v), &EXPECTED)),
+            Some(JsonValue::Array(_)) => return Err(D::Error::invalid_type(Unexpected::Seq, &EXPECTED)),
+            Some(JsonValue::Object(_)) => return Err(D::Error::invalid_type(Unexpected::Map, &EXPECTED)),
         }
     }
 

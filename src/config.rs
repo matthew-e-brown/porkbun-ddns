@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
-use anyhow::Context;
 use clap::Parser;
+use eyre::WrapErr;
 use serde::{Deserialize, Deserializer, de};
 use tokio::fs;
 
@@ -91,11 +91,11 @@ pub struct Config {
 
 impl Config {
     /// Loads runtime configuration from command line arguments and configuration file.
-    pub async fn init() -> anyhow::Result<Self> {
+    pub async fn init() -> eyre::Result<Self> {
         let args = Args::parse();
 
-        let text = fs::read_to_string(&args.cfg).await.context("failed to read config file")?;
-        let mut config: Config = toml::from_str(&text).context("failed to parse config file")?;
+        let text = fs::read_to_string(&args.cfg).await.wrap_err("failed to read config file")?;
+        let mut config: Config = toml::from_str(&text).wrap_err("failed to parse config file")?;
 
         config.extend_from_args(&args);
         Ok(config)
@@ -156,7 +156,7 @@ impl Target {
     pub fn matches_record(&self, record: &DNSRecord) -> bool {
         match self.subdomain() {
             // '@' as a subdomain refers to the root of the domain; check the whole thing.
-            Some("@") | Some("") | None => record.name == self.domain,
+            Some("@") | None => record.name == self.domain,
             // Could do this by just just allocating "{subdomain}.{domain}" and comparing... but that means allocating!
             Some(sub) => {
                 record.name.starts_with(sub)
@@ -167,10 +167,12 @@ impl Target {
         }
     }
 
-    pub fn fmt_name(&self) -> String {
+    /// Gets a print-friendly label for this target, representing how it was provided in the config file (e.g., this
+    /// will return "@.domain.com" even though "@" is usually transparent)
+    pub fn label(&self) -> String {
         match self.subdomain() {
-            Some("@") | Some("") | None => self.domain().to_string(),
             Some(sub) => format!("{sub}.{}", self.domain()),
+            None => self.domain().to_string(),
         }
     }
 }
@@ -216,6 +218,10 @@ impl<'de> Deserialize<'de> for Target {
 
                 let domain = domain.ok_or_else(|| de::Error::missing_field("domain"))?;
                 let ttl = ttl.unwrap_or(600);
+
+                if subdomain.as_deref() == Some("") {
+                    subdomain = None;
+                }
 
                 Ok(Target { domain, subdomain, ttl })
             }
