@@ -21,15 +21,13 @@ pub async fn main() -> ExitCode {
         },
     };
 
-    // If both are disabled (potentially valid if the user wants to temporarily disable by modifying the config)
-    if !app.config.ipv4 && !app.config.ipv6 {
-        eprintln!("Both IPv4 and IPv6 are disabled. Nothing to do.");
-        return ExitCode::SUCCESS;
-    }
-
-    // Otherwise, *at least one* of the two will be true, so we should always get back at least one `Some` from this
-    // unless something goes wrong.
     let (ipv4, ipv6) = match app.get_addresses().await.wrap_err("failed to fetch IP address(es)") {
+        // `get_addresses` will return two `None`s only if both are disabled. Otherwise, at least one is enabled,
+        // meaning the only other option is for an error to have occurred or for at least one of them to be valid.
+        Ok((None, None)) => {
+            println!("Both IPv4 and IPv6 are disabled. Nothing to do.");
+            return ExitCode::SUCCESS;
+        },
         Ok(addrs) => addrs,
         Err(err) => {
             report_error(err);
@@ -91,7 +89,15 @@ impl App {
 
     /// Fetches IPv4 and IPv6 addresses for the current system.
     pub async fn get_addresses(&self) -> eyre::Result<(Option<Ipv4Addr>, Option<Ipv6Addr>)> {
-        println!("Fetching IP addresses...");
+        let num_enabled = self.config.ipv4 as usize + self.config.ipv6 as usize;
+        println!(
+            "Fetching current IP {addresses}...",
+            addresses = if num_enabled == 1 { "address" } else { "addresses" },
+        );
+
+        if num_enabled == 0 {
+            return Ok((None, None));
+        }
 
         let mut ipv4 = None;
         let mut ipv6 = None;
@@ -105,8 +111,9 @@ impl App {
                 }
 
                 if self.config.ipv6 {
-                    if self.config.ipv6_error {
-                        return Err(eyre!("ipv6_error: could not get IPv6 address from Porkbun API"));
+                    // If IPv6 is set to hard-error mode, or if IPv6 is the only one enabled, this is an error.
+                    if self.config.ipv6_error || !self.config.ipv4 {
+                        return Err(eyre!("failed to get IPv6 address from Porkbun API"));
                     }
 
                     // If the non-IPv4 endpoint gave us IPv4, then we can't get an IPv6. We don't even need to try.
