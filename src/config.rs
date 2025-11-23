@@ -1,7 +1,9 @@
+use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::path::PathBuf;
 
 use clap::Parser;
-use eyre::WrapErr;
+use eyre::{WrapErr, eyre};
 use serde::{Deserialize, Deserializer, de};
 use tokio::fs;
 
@@ -98,6 +100,24 @@ impl Config {
         let mut config: Config = toml::from_str(&text).wrap_err("failed to parse config file")?;
 
         config.extend_from_args(&args);
+
+        // Check that all targets are unique:
+        let mut tgt_labels = HashMap::with_capacity(config.targets.len());
+        let mut i = 0;
+        for tgt in &config.targets {
+            i += 1;
+            match tgt_labels.entry(tgt.label()) {
+                Entry::Vacant(entry) => {
+                    entry.insert(i);
+                },
+                Entry::Occupied(entry) => {
+                    let j = *entry.get();
+                    let k = entry.key();
+                    return Err(eyre!("encountered multiple targets both for {k} (targets {j} and {i})"));
+                },
+            }
+        }
+
         Ok(config)
     }
 
@@ -123,7 +143,7 @@ impl Config {
 
 
 /// Specification for a single domain or subdomain to update.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Target {
     domain: String,
     subdomain: Option<String>,
