@@ -20,18 +20,52 @@ use self::config::{Config, Target};
 // - Once all records have been retrieved, targets can be done in parallel by looking up their records in the map
 
 #[tokio::main]
-pub async fn main() -> eyre::Result<()> {
-    let mut app = App::init().await.wrap_err("failed to initialize application")?;
+pub async fn main() -> ExitCode {
+    let mut app = match App::init().await.wrap_err("application failed to start") {
+        Ok(app) => app,
+        Err(err) => {
+            report_error(err);
+            return ExitCode::FAILURE;
+        },
+    };
 
-    if !app.config.ipv4 && !app.config.ipv6 {
-        println!("Nothing to do. Both IPv4 (A) and IPv6 (AAAA) are disabled.");
-        return Ok(());
+    match app.get_addresses().await.wrap_err("failed to fetch IP address(es)") {
+        Ok(()) => {},
+        Err(err) => {
+            report_error(err);
+            return ExitCode::FAILURE;
+        },
     }
 
-    app.get_addresses().await?;
-    app.get_records().await;
-    app.run().await;
-    Ok(())
+    match app.run().await {
+        0 => {
+            println!("Done.");
+            ExitCode::SUCCESS
+        },
+        n => {
+            eprintln!(
+                "Encountered {n} {errors}. See output for details.",
+                errors = if n == 1 { "error" } else { "errors" },
+            );
+
+            ExitCode::FAILURE
+        },
+    }
+}
+
+fn report_error(err: eyre::Report) {
+    todo!("error report: {err}");
+}
+
+/// The main application instance. Wraps both
+///
+/// Having this be a separate struct alleviates the need for so many
+struct App {
+    config: Config,
+    client: PorkbunClient,
+    ipv4: Option<Ipv4Addr>,
+    ipv6: Option<Ipv6Addr>,
+    records: HashMap<String, Vec<DNSRecord>>,
 }
 
 #[inline]
@@ -46,26 +80,13 @@ fn get_var(key: &str) -> eyre::Result<String> {
     std::env::var(key).wrap_err_with(|| format!("failed to load environment variable {key}"))
 }
 
-struct App {
-    config: Config,
-    client: PorkbunClient,
-    ipv4: Option<Ipv4Addr>,
-    ipv6: Option<Ipv6Addr>,
-    records: HashMap<String, Vec<DNSRecord>>,
-    /*
-    Possible solution?
-    /// Tracks the total number of errors that have occurred over the runtime of the program.
-    num_errors: Mutex<u8>,
-    */
-}
-
 impl App {
     /// Initializes the application instance.
     pub async fn init() -> eyre::Result<Self> {
+        let config = Config::init().await?;
+
         let api_key = get_var("PORKBUN_API_KEY")?;
         let secret_key = get_var("PORKBUN_SECRET_KEY")?;
-
-        let config = Config::init().await?;
         let client = PorkbunClient::new(api_key, secret_key);
 
         Ok(Self {
@@ -73,18 +94,8 @@ impl App {
             client,
             ipv4: None,
             ipv6: None,
-            // NB: Gets replaced by `get_records`, but that's okay: empty hashmap don't allocate.
             records: HashMap::new(),
         })
-    }
-
-    /// Gets the application's final return code based on errors that occurred during runtime.
-    pub fn exit_code(&self) -> ExitCode {
-        todo!();
-    }
-
-    fn report_error(error: eyre::Report) {
-        todo!();
     }
 
     /// Fetches IPv4 and IPv6 addresses for the current system and stores them within the application instance.
@@ -142,10 +153,11 @@ impl App {
 
     /// Fetch all currently existing DNS records for all target domains specified in the configuration.
     ///
-    /// Even though it is possible for record fetching to fail, this method is infallible. Instead of having each domain
-    /// potentially throw and propagate errors, we let each one simply display its errors directly to the main output.
-    /// Each target can then deal with the failure separately when it sees its list of records not present in the map.
-    pub async fn get_records(&mut self) {
+    /// Even though it is possible for record fetching to fail, this method is infallible; instead, each failure is
+    /// reported to the end user directly from within. This method then simply returns the number of errors that
+    /// occurred while fetching. Any target whose domain failed to fetch records can then just log a simple message and
+    /// skip running any further.
+    async fn get_records(&mut self) -> usize {
         // First build a unique list of root domain names: then we can send each one on its own task to get records.
         let domains = {
             let mut v = Vec::new();
@@ -172,69 +184,94 @@ impl App {
         // lock past an await point. Either tokio is using separate threads for async runtime, and a blocking mutex is
         // fine; or it's using a single-threaded runtime, in which case no other thread could be holding the lock. This
         // would also make sense as a RwLock, except for the fact that we're only ever writing.
-        let all_records = Mutex::new(&mut self.records);
-        let rec_tasks = domains.into_iter().map(async |domain| -> () {
+        let record_mutex = Mutex::new(&mut self.records);
+        let record_tasks = domains.into_iter().map(async |domain| -> Result<(), ()> {
             println!("Fetching existing records for {domain}...");
             match self.client.get_existing_records(domain).await {
                 Ok(mut records) => {
                     // We only ever need A/AAAA records, get rid of everything else.
                     records.retain(|r| (self.config.ipv4 && r.typ == "A") || (self.config.ipv6 && r.typ == "AAAA"));
 
-                    println!("Found {} {search_type} records for {domain}.", records.len());
+                    println!("Found {count} {search_type} records for {domain}.", count = records.len());
 
-                    let mut map = all_records.lock().unwrap();
+                    let mut map = record_mutex.lock().expect("mutex should not be poisoned");
                     map.insert(domain.to_string(), records);
+                    Ok(())
                 },
                 Err(err) => {
-                    // [TODO] Report to user and propagate to process exit code
-                    Err::<(), _>(err.wrap_err(format!("failed to fetch DNS records for domain {domain}"))).unwrap();
+                    let err = err.wrap_err(format!("failed to fetch DNS records for domain {domain}"));
+                    report_error(err);
+                    Err(())
                 },
             }
         });
 
-        // Futures return `()` so this `JoinAll` future will never actually allocate a vector.
-        futures::future::join_all(rec_tasks).await;
+        futures::future::join_all(record_tasks)
+            .await
+            .into_iter()
+            .filter(Result::is_err)
+            .count()
     }
 
-    pub async fn run(&self) -> () {
+    /// Run the application.
+    ///
+    /// Even though it is very possible for pieces of this application to fail
+    pub async fn run(&mut self) -> usize {
+        let mut err_count = self.get_records().await;
+
         let tasks = self
             .config
             .targets
             .iter()
             .enumerate()
             .filter_map(|(i, target)| {
+                let i = i + 1; // 1-based indexing
+
                 let Some(records) = self.records.get(target.domain()) else {
                     // Target's records might be missing if we previously failed to fetch them. Error would've already
-                    // been logged in that case, so we can just silently skip over this target.
+                    // been logged in that case, so we don't need to report another one. Just a regular print is fine.
+                    println!("target {i} ({}) skipped due to missing DNS records", target.label());
 
-                    // [TODO] Report to user, but don't propagate to process exit code (already done above).
-                    Err::<(), _>(eyre!("target {i} skipped due to previous error")).unwrap();
+                    // Skip over this target in the outer `filter_map`.
                     return None;
                 };
 
-                let app = &*self; // Need a borrow that we can safely move into closure
-                let addresses = [self.ipv4.map(IpAddr::V4), self.ipv6.map(IpAddr::V6)];
-                let addr_tasks = addresses.into_iter().filter_map(move |addr| {
-                    addr.map(async move |addr| {
+                // Convert an iterator of `Option<IpAddr>` into an iterator of `Option<impl Future>`, which gets
+                // filtered down into an iterator of `impl Future`.
+                let app = &*self; // Need non-mutable borrow to move into closure
+                let addrs = [self.ipv4.map(IpAddr::V4), self.ipv6.map(IpAddr::V6)];
+                let tasks = addrs.into_iter().filter_map(move |addr| {
+                    addr.map(async move |addr: IpAddr| -> Result<(), ()> {
                         if let Err(err) = app.handle_target(i, target, records, addr).await {
-                            // [TODO] Report to user and propagate to process exit code
-                            Err(err.wrap_err(format!("target {i} failed"))).unwrap()
+                            let msg = format!("target {i} ({}) failed", target.label());
+                            report_error(err.wrap_err(msg));
+                            Err(())
+                        } else {
+                            Ok(())
                         }
                     })
                 });
 
-                Some(addr_tasks)
+                // Return an `Iterator<impl Future>` to the outer `filter_map`, giving `Iter<Iter<impl Future>>`, which
+                // then gets flattened down into one final iterator of futures.
+                Some(tasks)
             })
             .flatten();
 
-        futures::future::join_all(tasks).await;
+        err_count += futures::future::join_all(tasks)
+            .await
+            .into_iter()
+            .filter(Result::is_err)
+            .count();
+
+        err_count
     }
 
     async fn handle_target(&self, i: usize, target: &Target, records: &[DNSRecord], addr: IpAddr) -> eyre::Result<()> {
         // Check if any of the existing records for this target's domain actually match the target precisely:
         let mut matching_records = records
             .iter()
-            .filter(|rec| rec.typ == addr.dns_type() && target.matches_record(rec));
+            .filter(|rec| rec.typ == addr.dns_type() && target.record_matches(rec));
 
         let existing = matching_records.next();
         let num_left = matching_records.count();
@@ -255,54 +292,69 @@ impl App {
         }
     }
 
+    // [TODO] Tidy the whole "reporting" situation up. Sort of in-between rewrites here, so:
+    //
+    // - Currently there is both `target.label()` for just getting the domain name, plus this function with extra
+    //   formatting on main log lines
+    // - Reported errors use a different formatting for targets than regular log output.
+    //
+    // We'll have to deal with this messiness later.
+
+    /// Gets a print-friendly label for the given target, representing how it was provided in the config file (e.g.,
+    /// this will return "@.domain.com" even though "@" is usually transparent). Used for log output lines.
+    fn fmt_label(&self, i: usize, target: &Target) -> String {
+        let mut label = match target.subdomain() {
+            Some(sub) => format!("[{i}: {sub}.{}]", target.domain()),
+            None => format!("[{i}: {}]", target.domain()),
+        };
+
+        if self.config.dry_run {
+            label += " [DRY RUN]";
+        }
+
+        label
+    }
+
     async fn do_nothing(&self, i: usize, target: &Target, record: &DNSRecord) -> eyre::Result<()> {
         let DNSRecord { typ, id, content, .. } = record;
-        let label = target.label();
-        let dr = if self.config.dry_run { " [DRY RUN]" } else { "" };
-        println!("[{i}: {label}] Found existing {typ} record #{id} with content {content}.",);
-        println!("[{i}: {label}]{dr} Nothing to do.");
+        let label = self.fmt_label(i, target);
+        println!("{label} Found existing {typ} record #{id} with content {content}.",);
+        println!("{label} Nothing to do.");
         Ok(())
     }
 
     async fn edit_record(&self, i: usize, target: &Target, record: &DNSRecord, new_addr: IpAddr) -> eyre::Result<()> {
         let DNSRecord { typ, id, content, .. } = record;
-        let label = target.label();
-        println!("[{i}: {label}] Found existing {typ} record #{id} with content {content}.");
+        let label = self.fmt_label(i, target);
+        println!("{label} Found existing {typ} record #{id} with content {content}.");
 
-        let dr;
-        if self.config.dry_run {
-            dr = " [DRY RUN]";
-        } else {
-            dr = "";
+        if !self.config.dry_run {
             self.client
                 .edit_record(target, &record.id, new_addr)
                 .await
                 .wrap_err("failed to edit DNS record")?;
         }
 
-        println!("[{i}: {label}]{dr} Edited record #{id} content from {content} to {new_addr}.");
+        println!("{label} Edited record #{id} content from {content} to {new_addr}.");
         Ok(())
     }
 
     async fn create_record(&self, i: usize, target: &Target, new_addr: IpAddr) -> eyre::Result<()> {
-        let label = target.label();
-        println!("[{i}: {label}] Did not find existing {} record.", new_addr.dns_type());
+        let label = self.fmt_label(i, target);
+        println!("{label} Did not find existing {} record.", new_addr.dns_type());
 
-        let dr;
         let id;
-        if self.config.dry_run {
-            dr = " [DRY RUN]";
-            id = "<record_id>".to_string();
-        } else {
-            dr = "";
+        if !self.config.dry_run {
             id = self
                 .client
                 .create_record(target, new_addr)
                 .await
                 .wrap_err("failed to create DNS record")?;
+        } else {
+            id = "<record_id>".to_string();
         }
 
-        println!("[{i}: {label}]{dr} Created new record #{id} with content {new_addr}.");
+        println!("{label} Created new record #{id} with content {new_addr}.");
         Ok(())
     }
 }

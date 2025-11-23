@@ -143,7 +143,7 @@ impl Target {
         self.ttl
     }
 
-    /// Creates a default [`DomainJob`] out of just a domain name.
+    /// Creates a default [`Target`] out of just a domain name.
     fn from_domain(domain: String) -> Self {
         Self {
             domain,
@@ -152,8 +152,8 @@ impl Target {
         }
     }
 
-    /// Checks if this job matches the given DNS record.
-    pub fn matches_record(&self, record: &DNSRecord) -> bool {
+    /// Checks if the given [record][DNSRecord] matches this [target][Target].
+    pub fn record_matches(&self, record: &DNSRecord) -> bool {
         match self.subdomain() {
             // '@' as a subdomain refers to the root of the domain; check the whole thing.
             Some("@") | None => record.name == self.domain,
@@ -167,8 +167,10 @@ impl Target {
         }
     }
 
-    /// Gets a print-friendly label for this target, representing how it was provided in the config file (e.g., this
-    /// will return "@.domain.com" even though "@" is usually transparent)
+    /// Gets a print-friendly label for this [target][Target] that represents how it was specified in the config file.
+    ///
+    /// For example, if a target is specified using `@` to refer to the root domain, this method will return
+    /// `@.domain.com`, even though what we send Porkbun's API looks like `domain.com`.
     pub fn label(&self) -> String {
         match self.subdomain() {
             Some(sub) => format!("{sub}.{}", self.domain()),
@@ -185,9 +187,9 @@ impl<'de> Deserialize<'de> for Target {
         D::Error: de::Error,
     {
         // ----------------------------------------------------------------------------------------
-        struct DomainVisitor;
+        struct TargetVisitor;
 
-        impl<'de> de::Visitor<'de> for DomainVisitor {
+        impl<'de> de::Visitor<'de> for TargetVisitor {
             type Value = Target;
 
             fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
@@ -228,6 +230,6 @@ impl<'de> Deserialize<'de> for Target {
         }
         // ----------------------------------------------------------------------------------------
 
-        deserializer.deserialize_any(DomainVisitor)
+        deserializer.deserialize_any(TargetVisitor)
     }
 }
