@@ -4,7 +4,6 @@ mod config;
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::process::ExitCode;
-use std::sync::Mutex;
 
 use eyre::{WrapErr, eyre};
 
@@ -12,16 +11,9 @@ use self::api::model::DNSRecord;
 use self::api::{IpAddrExt, PorkbunClient};
 use self::config::{Config, Target};
 
-// - Read configuration and construct the client
-// - Try and read the current IP addresses
-//   - Error out completely if we couldn't get them
-// - Grab all current A/AAAA records for all domain across all targets
-//   - Store them as `Results` so we can do dependent jobs lazily
-// - Once all records have been retrieved, targets can be done in parallel by looking up their records in the map
-
 #[tokio::main]
 pub async fn main() -> ExitCode {
-    let mut app = match App::init().await.wrap_err("application failed to start") {
+    let app = match App::init().await.wrap_err("application failed to start") {
         Ok(app) => app,
         Err(err) => {
             report_error(err);
@@ -29,15 +21,23 @@ pub async fn main() -> ExitCode {
         },
     };
 
-    match app.get_addresses().await.wrap_err("failed to fetch IP address(es)") {
-        Ok(()) => {},
+    // If both are disabled (potentially valid if the user wants to temporarily disable by modifying the config)
+    if !app.config.ipv4 && !app.config.ipv6 {
+        eprintln!("Both IPv4 and IPv6 are disabled. Nothing to do.");
+        return ExitCode::SUCCESS;
+    }
+
+    // Otherwise, *at least one* of the two will be true, so we should always get back at least one `Some` from this
+    // unless something goes wrong.
+    let (ipv4, ipv6) = match app.get_addresses().await.wrap_err("failed to fetch IP address(es)") {
+        Ok(addrs) => addrs,
         Err(err) => {
             report_error(err);
             return ExitCode::FAILURE;
         },
-    }
+    };
 
-    match app.run().await {
+    match app.run(ipv4, ipv6).await {
         0 => {
             println!("Done.");
             ExitCode::SUCCESS
@@ -57,15 +57,12 @@ fn report_error(err: eyre::Report) {
     todo!("error report: {err}");
 }
 
-/// The main application instance. Wraps both
+/// The main application instance. Wraps both the program [`Config`] and a [`PorkbunClient`].
 ///
-/// Having this be a separate struct alleviates the need for so many
+/// Having this be a separate struct alleviates needing to pass so many parameters around.
 struct App {
     config: Config,
     client: PorkbunClient,
-    ipv4: Option<Ipv4Addr>,
-    ipv6: Option<Ipv6Addr>,
-    records: HashMap<String, Vec<DNSRecord>>,
 }
 
 #[inline]
@@ -83,39 +80,28 @@ fn get_var(key: &str) -> eyre::Result<String> {
 impl App {
     /// Initializes the application instance.
     pub async fn init() -> eyre::Result<Self> {
-        let config = Config::init().await?;
+        let config = Config::load().await.wrap_err("failed to load config")?;
 
         let api_key = get_var("PORKBUN_API_KEY")?;
         let secret_key = get_var("PORKBUN_SECRET_KEY")?;
         let client = PorkbunClient::new(api_key, secret_key);
 
-        Ok(Self {
-            config,
-            client,
-            ipv4: None,
-            ipv6: None,
-            records: HashMap::new(),
-        })
+        Ok(Self { config, client })
     }
 
-    /// Fetches IPv4 and IPv6 addresses for the current system and stores them within the application instance.
-    ///
-    /// After completion, [`self.ipv4`] and [`self.ipv6`] will be set to `Some` if they were enabled in the
-    /// configuration
-    ///
-    /// [`self.ipv4`]: Self::ipv4
-    /// [`self.ipv6`]: Self::ipv6
-    pub async fn get_addresses(&mut self) -> eyre::Result<()> {
+    /// Fetches IPv4 and IPv6 addresses for the current system.
+    pub async fn get_addresses(&self) -> eyre::Result<(Option<Ipv4Addr>, Option<Ipv6Addr>)> {
         println!("Fetching IP addresses...");
+
+        let mut ipv4 = None;
+        let mut ipv6 = None;
 
         // Ping the base `/ping` endpoint first: it returns either IPv6 or IPv4.
         match self.client.ping().await? {
             IpAddr::V4(addr) => {
                 if self.config.ipv4 {
                     println!("Got IPv4 address: {addr}");
-                    self.ipv4 = Some(addr);
-                } else {
-                    self.ipv4 = None;
+                    ipv4 = Some(addr);
                 }
 
                 if self.config.ipv6 {
@@ -123,79 +109,67 @@ impl App {
                         return Err(eyre!("ipv6_error: could not get IPv6 address from Porkbun API"));
                     }
 
-                    // If the non-IPv4 endpoint gave us IPv4, we can't get an IPv6 address, so we don't even need to
-                    // try.
+                    // If the non-IPv4 endpoint gave us IPv4, then we can't get an IPv6. We don't even need to try.
                     println!("Got IPv6 address: none.");
-                    self.ipv6 = None;
                 }
             },
             IpAddr::V6(addr) => {
                 if self.config.ipv6 {
                     println!("Got IPv6 address: {addr}");
-                    self.ipv6 = Some(addr);
-                } else {
-                    self.ipv6 = None;
+                    ipv6 = Some(addr);
                 }
 
                 if self.config.ipv4 {
                     println!("Pinging again for IPv4 address...");
                     let addr = self.client.ping_v4().await?;
                     println!("Got IPv4 address: {addr}");
-                    self.ipv4 = Some(addr);
-                } else {
-                    self.ipv4 = None;
+                    ipv4 = Some(addr);
                 }
             },
         }
 
-        Ok(())
+        Ok((ipv4, ipv6))
     }
 
-    /// Fetch all currently existing DNS records for all target domains specified in the configuration.
+    /// Run the application.
     ///
-    /// Even though it is possible for record fetching to fail, this method is infallible; instead, each failure is
-    /// reported to the end user directly from within. This method then simply returns the number of errors that
-    /// occurred while fetching. Any target whose domain failed to fetch records can then just log a simple message and
-    /// skip running any further.
-    async fn get_records(&mut self) -> usize {
-        // First build a unique list of root domain names: then we can send each one on its own task to get records.
-        let domains = {
-            let mut v = Vec::new();
-            // There should never really be that many targets/domains, so we'll just use a plain linear search to prune
-            // duplicates. Intuition says this'll probably be cheaper overall than the potential overhead from something
-            // like HashSet/BTreeSet. Plus, it lets us keep their relative order as defined in the config file.
-            for target in &self.config.targets {
-                let domain = target.domain();
-                if !v.contains(&domain) {
-                    v.push(domain);
-                }
-            }
-            v
+    /// Even though it is very possible for pieces of this application to fail, this method does not return a `Result`.
+    /// Instead, this method handles logging/reporting all errors that occur over the course of the entire operation.
+    /// Then, the total number of errors is returned.
+    pub async fn run(&self, ipv4: Option<Ipv4Addr>, ipv6: Option<Ipv6Addr>) -> usize {
+        // Used for printing more accurate log messages.
+        let search_type = match (ipv4, ipv6) {
+            (Some(_), None) => "A",
+            (None, Some(_)) => "AAAA",
+            (Some(_), Some(_)) => "A/AAAA",
+            // Shouldn't be possible to get this far with neither address; rest of application should have handled it.
+            // Either way, this method has nothing to do, so we can just return as normal.
+            (None, None) => return 0,
         };
 
-        // Used for printing a more accurate log message:
-        let search_type = match (self.config.ipv4, self.config.ipv6) {
-            (true, false) => "A",
-            (false, true) => "AAAA",
-            _ => "A/AAAA",
-        };
+        // Step 1: Fetch existing records for all domains
+        // =============================================================================================================
 
-        // NB: std::mutex (blocking) is fine here over tokio::mutex (non-blocking) because we never need to hold the
-        // lock past an await point. Either tokio is using separate threads for async runtime, and a blocking mutex is
-        // fine; or it's using a single-threaded runtime, in which case no other thread could be holding the lock. This
-        // would also make sense as a RwLock, except for the fact that we're only ever writing.
-        let record_mutex = Mutex::new(&mut self.records);
-        let record_tasks = domains.into_iter().map(async |domain| -> Result<(), ()> {
-            println!("Fetching existing records for {domain}...");
+        // First build a unique list of root domain names. Then we can send each one on its own task to get records.
+        let mut current_records = HashMap::<&str, Box<[DNSRecord]>>::new();
+
+        for target in &self.config.targets {
+            // Start each one off with an empty (read: non-allocating) boxed-slice that can get replaced through a
+            // `&mut` reference in each task.
+            let domain = target.domain();
+            current_records.entry(domain).or_insert_with(|| [].into());
+        }
+
+        let record_tasks = current_records.iter_mut().map(async |(domain, records)| -> Result<(), ()> {
             match self.client.get_existing_records(domain).await {
-                Ok(mut records) => {
+                Ok(mut existing) => {
                     // We only ever need A/AAAA records, get rid of everything else.
-                    records.retain(|r| (self.config.ipv4 && r.typ == "A") || (self.config.ipv6 && r.typ == "AAAA"));
+                    existing.retain(|r| (ipv4.is_some() && r.typ == "A") || (ipv6.is_some() && r.typ == "AAAA"));
 
-                    println!("Found {count} {search_type} records for {domain}.", count = records.len());
+                    let count = existing.len();
+                    *records = existing.into_boxed_slice();
 
-                    let mut map = record_mutex.lock().expect("mutex should not be poisoned");
-                    map.insert(domain.to_string(), records);
+                    println!("Found {count} {search_type} records for {domain}.");
                     Ok(())
                 },
                 Err(err) => {
@@ -206,20 +180,16 @@ impl App {
             }
         });
 
-        futures::future::join_all(record_tasks)
+        let mut err_count = futures::future::join_all(record_tasks)
             .await
             .into_iter()
             .filter(Result::is_err)
-            .count()
-    }
+            .count();
 
-    /// Run the application.
-    ///
-    /// Even though it is very possible for pieces of this application to fail
-    pub async fn run(&mut self) -> usize {
-        let mut err_count = self.get_records().await;
+        // Step 2: Actually process all of the targets
+        // =============================================================================================================
 
-        let tasks = self
+        let target_tasks = self
             .config
             .targets
             .iter()
@@ -227,7 +197,7 @@ impl App {
             .filter_map(|(i, target)| {
                 let i = i + 1; // 1-based indexing
 
-                let Some(records) = self.records.get(target.domain()) else {
+                let Some(records) = current_records.get(target.domain()) else {
                     // Target's records might be missing if we previously failed to fetch them. Error would've already
                     // been logged in that case, so we don't need to report another one. Just a regular print is fine.
                     println!("target {i} ({}) skipped due to missing DNS records", target.label());
@@ -238,11 +208,10 @@ impl App {
 
                 // Convert an iterator of `Option<IpAddr>` into an iterator of `Option<impl Future>`, which gets
                 // filtered down into an iterator of `impl Future`.
-                let app = &*self; // Need non-mutable borrow to move into closure
-                let addrs = [self.ipv4.map(IpAddr::V4), self.ipv6.map(IpAddr::V6)];
+                let addrs = [ipv4.map(IpAddr::V4), ipv6.map(IpAddr::V6)];
                 let tasks = addrs.into_iter().filter_map(move |addr| {
-                    addr.map(async move |addr: IpAddr| -> Result<(), ()> {
-                        if let Err(err) = app.handle_target(i, target, records, addr).await {
+                    addr.map(async move |addr| -> Result<(), ()> {
+                        if let Err(err) = self.handle_target(i, target, records, addr).await {
                             let msg = format!("target {i} ({}) failed", target.label());
                             report_error(err.wrap_err(msg));
                             Err(())
@@ -258,7 +227,7 @@ impl App {
             })
             .flatten();
 
-        err_count += futures::future::join_all(tasks)
+        err_count += futures::future::join_all(target_tasks)
             .await
             .into_iter()
             .filter(Result::is_err)

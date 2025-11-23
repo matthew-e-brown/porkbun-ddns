@@ -93,11 +93,11 @@ pub struct Config {
 
 impl Config {
     /// Loads runtime configuration from command line arguments and configuration file.
-    pub async fn init() -> eyre::Result<Self> {
+    pub async fn load() -> eyre::Result<Self> {
         let args = Args::parse();
 
-        let text = fs::read_to_string(&args.cfg).await.wrap_err("failed to read config file")?;
-        let mut config: Config = toml::from_str(&text).wrap_err("failed to parse config file")?;
+        let text = fs::read_to_string(&args.cfg).await.wrap_err("failed to read file")?;
+        let mut config: Config = toml::from_str(&text).wrap_err("failed to parse file")?;
 
         config.extend_from_args(&args);
 
@@ -113,7 +113,8 @@ impl Config {
                 Entry::Occupied(entry) => {
                     let j = *entry.get();
                     let k = entry.key();
-                    return Err(eyre!("encountered multiple targets both for {k} (targets {j} and {i})"));
+                    return Err(eyre!("encountered multiple targets both for {k} (targets {j} and {i})")
+                        .wrap_err("invalid config"));
                 },
             }
         }
