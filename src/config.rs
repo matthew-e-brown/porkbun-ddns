@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
-use anyhow::Context;
 use clap::Parser;
+use eyre::WrapErr;
 use serde::{Deserialize, Deserializer, de};
 use tokio::fs;
 
@@ -84,21 +84,20 @@ pub struct Config {
     #[serde(default = "bool::<false>")]
     pub ipv6_error: bool,
 
-    /// A list of domains to update.
+    /// A list of jobs describing domains/subdomains to update.
     #[serde(default = "empty")]
-    pub domains: Vec<DomainJob>,
+    pub targets: Vec<Target>,
 }
 
 impl Config {
     /// Loads runtime configuration from command line arguments and configuration file.
-    pub async fn init() -> anyhow::Result<Self> {
+    pub async fn init() -> eyre::Result<Self> {
         let args = Args::parse();
 
-        let text = fs::read_to_string(&args.cfg).await.context("failed to read config file")?;
-        let mut config: Config = toml::from_str(&text).context("failed to parse config file")?;
+        let text = fs::read_to_string(&args.cfg).await.wrap_err("failed to read config file")?;
+        let mut config: Config = toml::from_str(&text).wrap_err("failed to parse config file")?;
 
         config.extend_from_args(&args);
-
         Ok(config)
     }
 
@@ -123,15 +122,15 @@ impl Config {
 }
 
 
-/// Job specification for a single domain or subdomain to update.
+/// Specification for a single domain or subdomain to update.
 #[derive(Debug)]
-pub struct DomainJob {
+pub struct Target {
     domain: String,
     subdomain: Option<String>,
     ttl: u32,
 }
 
-impl DomainJob {
+impl Target {
     pub fn domain(&self) -> &str {
         &self.domain[..]
     }
@@ -154,7 +153,7 @@ impl DomainJob {
     }
 
     /// Checks if this job matches the given DNS record.
-    pub fn check_record(&self, record: &DNSRecord) -> bool {
+    pub fn matches_record(&self, record: &DNSRecord) -> bool {
         match self.subdomain() {
             // '@' as a subdomain refers to the root of the domain; check the whole thing.
             Some("@") | None => record.name == self.domain,
@@ -168,16 +167,18 @@ impl DomainJob {
         }
     }
 
-    pub fn fmt_name(&self) -> String {
+    /// Gets a print-friendly label for this target, representing how it was provided in the config file (e.g., this
+    /// will return "@.domain.com" even though "@" is usually transparent)
+    pub fn label(&self) -> String {
         match self.subdomain() {
-            Some("@") | None => self.domain().to_string(),
             Some(sub) => format!("{sub}.{}", self.domain()),
+            None => self.domain().to_string(),
         }
     }
 }
 
-/// [`DomainJob`] can be deserialized either as a single string or as a map of options.
-impl<'de> Deserialize<'de> for DomainJob {
+/// A [`Target`] can be deserialized either as a single string or as a map of options.
+impl<'de> Deserialize<'de> for Target {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
@@ -187,18 +188,18 @@ impl<'de> Deserialize<'de> for DomainJob {
         struct DomainVisitor;
 
         impl<'de> de::Visitor<'de> for DomainVisitor {
-            type Value = DomainJob;
+            type Value = Target;
 
             fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
                 formatter.write_str("string or map")
             }
 
             fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
-                Ok(DomainJob::from_domain(v.to_string()))
+                Ok(Target::from_domain(v.to_string()))
             }
 
             fn visit_string<E: de::Error>(self, v: String) -> Result<Self::Value, E> {
-                Ok(DomainJob::from_domain(v))
+                Ok(Target::from_domain(v))
             }
 
             fn visit_map<A: de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
@@ -218,7 +219,11 @@ impl<'de> Deserialize<'de> for DomainJob {
                 let domain = domain.ok_or_else(|| de::Error::missing_field("domain"))?;
                 let ttl = ttl.unwrap_or(600);
 
-                Ok(DomainJob { domain, subdomain, ttl })
+                if subdomain.as_deref() == Some("") {
+                    subdomain = None;
+                }
+
+                Ok(Target { domain, subdomain, ttl })
             }
         }
         // ----------------------------------------------------------------------------------------

@@ -1,32 +1,35 @@
 use std::net::{IpAddr, Ipv4Addr};
 
-use anyhow::anyhow;
 use chrono::Local;
-use reqwest::IntoUrl;
+use eyre::{WrapErr, eyre};
 use reqwest::header::{HeaderMap, HeaderValue};
 use serde::de::DeserializeOwned;
 use serde_json::{Map as JsonMap, Value as JsonValue, json};
 
-use super::AddressType;
 use super::model::{DNSRecord, DNSRecordList, Ping};
-use crate::config::DomainJob;
-
-
-const BASE_URL: &'static str = "https://api.porkbun.com/api/json/v3";
-const BASE_URL_V4: &'static str = "https://api-ipv4.porkbun.com/api/json/v3";
+use super::{BASE_URL, BASE_URL_V4, IpAddrExt};
+use crate::api::model::CreatedRecord;
+use crate::config::Target;
 
 type JsonObject = JsonMap<String, JsonValue>;
 
+/// Formats the full URL for an API endpoint into just its endpoint.
+#[inline]
+fn fmt_endpoint(url: &str) -> &str {
+    url.starts_with(BASE_URL).then(|| &url[BASE_URL.len() + 1..]).unwrap_or(url)
+}
+
 /// The access point to the Porkbun API.
+#[derive(Debug)]
 pub struct PorkbunClient {
-    inner: reqwest::Client,
+    reqwest: reqwest::Client,
     api_key: String,
     secret_key: String,
 }
 
 impl PorkbunClient {
-    pub fn new() -> anyhow::Result<Self> {
-        let ua_str = format!("{} {}", clap::crate_name!(), clap::crate_version!());
+    pub fn new(api_key: String, secret_key: String) -> Self {
+        let ua_str = format!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
         let client = reqwest::ClientBuilder::new()
             .default_headers(HeaderMap::from_iter([
                 (reqwest::header::ACCEPT, HeaderValue::from_static("application/json; charset=utf-8")),
@@ -35,87 +38,96 @@ impl PorkbunClient {
             .build()
             .unwrap();
 
-        #[inline]
-        fn get_env(key: &str) -> anyhow::Result<String> {
-            std::env::var(key).or_else(|_| Err(anyhow!("failed to get environment variable {key}")))
-        }
-
-        dotenvy::dotenv()?;
-        let api_key = get_env("PORKBUN_API_KEY")?;
-        let secret_key = get_env("PORKBUN_SECRET_KEY")?;
-
-        Ok(Self {
-            inner: client,
+        Self {
+            reqwest: client,
             api_key,
             secret_key,
-        })
+        }
     }
 
     /// Determine this system's current public IP address using Porkbun's `/ping` endpoint.
     ///
     /// Porkbun may return either an IPv4 or IPv6 address; see [`ping_v4`][Self::ping_v4].
-    pub async fn ping(&self) -> anyhow::Result<IpAddr> {
+    pub async fn ping(&self) -> eyre::Result<IpAddr> {
         let url = format!("{BASE_URL}/ping");
-        let res = self.request::<Ping>(url, None).await?;
+        let res = self
+            .request::<Ping>(&url, None)
+            .await
+            .wrap_err_with(|| format!("API request to {} failed", fmt_endpoint(&url)))?;
         Ok(res.your_ip)
     }
 
     /// Determine this system's current IPv4 address using Porkbun's `/ping` endpoint on the `api-ipv4.porkbun.com`
     /// subdomain.
-    pub async fn ping_v4(&self) -> anyhow::Result<Ipv4Addr> {
+    pub async fn ping_v4(&self) -> eyre::Result<Ipv4Addr> {
         let url = format!("{BASE_URL_V4}/ping");
-        let res = self.request::<Ping>(url, None).await?;
-        // What happens if a system *only* has IPv6? Will /ping return an error?
+        let res = self
+            .request::<Ping>(&url, None)
+            .await
+            .wrap_err_with(|| format!("API request to {} failed", fmt_endpoint(&url)))?;
+        // What happens if a system *only* has IPv6? Will the IPv4 /ping return an error?
         // ...I don't really have a way to test that.
         match res.your_ip {
             IpAddr::V4(addr) => Ok(addr),
-            IpAddr::V6(addr) => Err(anyhow!("IPv4 ping returned IPv6 address: {addr}")),
+            IpAddr::V6(addr) => Err(eyre!("IPv4-only ping somehow returned IPv6 address {addr}")),
         }
     }
 
     /// Gets all the existing records for the given domain name.
-    pub async fn get_existing_records(&self, domain: &str) -> anyhow::Result<Vec<DNSRecord>> {
+    pub async fn get_existing_records(&self, domain: &str) -> eyre::Result<Vec<DNSRecord>> {
         let url = format!("{BASE_URL}/dns/retrieve/{domain}");
-        let res = self.request::<DNSRecordList>(url, None).await?;
+        let res = self
+            .request::<DNSRecordList>(&url, None)
+            .await
+            .wrap_err_with(|| format!("API request to {} failed", fmt_endpoint(&url)))?;
         Ok(res.records)
     }
 
     /// Creates the JSON payload for creating or editing a DNS record.
-    fn record_payload<A: AddressType>(job: &DomainJob, content: &A::Addr) -> JsonValue {
+    fn make_dns_payload(target: &Target, content: IpAddr) -> JsonValue {
         let time = Local::now().format("%a %b %-d %Y at %I:%M:%S %p");
         json!({
-            "name": match job.subdomain() {
+            // In both create and edit payloads, the `name` field only includes the subdomain:
+            // - https://porkbun.com/api/json/v3/documentation#DNS%20Create%20Record
+            // - https://porkbun.com/api/json/v3/documentation#DNS%20Edit%20Record%20by%20Domain%20and%20ID
+            "name": match target.subdomain() {
                 Some("@") | None => "",
                 Some(sub) => sub,
             },
-            "type": A::RECORD_TYPE,
+            "type": content.dns_type(),
             "content": content,
-            "ttl": job.ttl(),
-            "notes": format!("Last updated by {} on {time}", clap::crate_name!()),
+            "ttl": target.ttl(),
+            "notes": format!("Last updated by {} on {time}", env!("CARGO_PKG_NAME")),
         })
     }
 
-    /// Edits a record for the given job with the given ID to have the given content.
-    pub async fn edit_record<A: AddressType>(
-        &self,
-        job: &DomainJob,
-        record_id: &str,
-        new_content: &A::Addr,
-    ) -> anyhow::Result<()> {
-        let url = format!("{BASE_URL}/dns/edit/{}/{}", job.domain(), record_id);
-        let payload = Self::record_payload::<A>(job, new_content);
-        self.request(url, Some(payload)).await
+    /// Edits an existing record for the given target.
+    ///
+    /// `record_id` must be fetched beforehand. It is not double checked to match Porkbun's API status before sending
+    /// the request.
+    pub async fn edit_record(&self, target: &Target, record_id: &str, new_content: IpAddr) -> eyre::Result<()> {
+        let url = format!("{BASE_URL}/dns/edit/{}/{}", target.domain(), record_id);
+        let payload = Self::make_dns_payload(target, new_content);
+        self.request::<()>(&url, Some(payload))
+            .await
+            .wrap_err_with(|| format!("API request to {} failed", fmt_endpoint(&url)))
     }
 
-    /// Creates a new DNS record for the given job with the given content.
-    pub async fn create_record<A: AddressType>(&self, job: &DomainJob, content: &A::Addr) -> anyhow::Result<()> {
-        let url = format!("{BASE_URL}/dns/create/{}", job.domain());
-        let payload = Self::record_payload::<A>(job, content);
-        self.request(url, Some(payload)).await
+    /// Creates a new DNS record for the given target with the given content.
+    ///
+    /// Returns the ID of the newly created record.
+    pub async fn create_record(&self, target: &Target, content: IpAddr) -> eyre::Result<String> {
+        let url = format!("{BASE_URL}/dns/create/{}", target.domain());
+        let payload = Self::make_dns_payload(target, content);
+        let res = self
+            .request::<CreatedRecord>(&url, Some(payload))
+            .await
+            .wrap_err_with(|| format!("API request to {} failed", fmt_endpoint(&url)))?;
+        Ok(res.id)
     }
 
     /// Makes a POST request to Porkbun's API and returns the result parsed from JSON.
-    async fn request<R>(&self, url: impl IntoUrl, payload: Option<JsonValue>) -> anyhow::Result<R>
+    async fn request<R>(&self, url: &str, payload: Option<JsonValue>) -> eyre::Result<R>
     where
         R: DeserializeOwned,
     {
@@ -128,25 +140,41 @@ impl PorkbunClient {
         payload.insert("apikey".to_string(), json!(self.api_key));
         payload.insert("secretapikey".to_string(), json!(self.secret_key));
 
-        let res = self.inner.post(url).json(&payload).send().await?;
-        let res = res.json::<JsonValue>().await?;
+        // Send the request and get its response as raw text before parsing it to JSON ourselves; lets us be more
+        // precise with our error handling.
+        let res_raw = self
+            .reqwest
+            .post(url)
+            .json(&payload)
+            .send()
+            .await
+            .wrap_err("POST request failed")?;
+        let res_text = res_raw.text().await.wrap_err("could not read POST response body")?;
+        let res_json = serde_json::from_str(&res_text[..]).wrap_err("received invalid JSON from Porkbun API")?;
 
         // All Porkbun endpoints should return objects with a 'status'
-        match res {
-            JsonValue::Object(mut map) if matches!(map.get_str("status"), Some("SUCCESS")) => {
+        match res_json {
+            JsonValue::Object(mut map) if map.get_str("status") == Some("SUCCESS") => {
                 map.remove("status");
                 // Now that we've removed 'status', parse the rest of it
-                let parsed = serde_json::from_value(JsonValue::Object(map))?;
+                let parsed = serde_json::from_value(JsonValue::Object(map))
+                    .wrap_err("could not parse JSON response from Porkbun API into valid type")?;
                 Ok(parsed)
             },
-            _ => {
-                if let JsonValue::Object(ref map) = res
-                    && let Some("ERROR") = map.get_str("status")
-                    && let Some(msg) = map.get_str("message")
+            mut json => {
+                if let JsonValue::Object(ref mut map) = json
+                    && map.get_str("status") == Some("ERROR")
+                    && map.get("message").is_some_and(JsonValue::is_string)
                 {
-                    Err(anyhow!(msg.to_string()).context("Porkbun API returned an error status"))
+                    let Some(JsonValue::String(msg)) = map.remove("message") else {
+                        // We already matched for this exact thing, we just didn't want to remove the owned copy of the
+                        // string until all checks had passed.
+                        unreachable!();
+                    };
+
+                    Err(eyre!(msg).wrap_err("received error from Porkbun API"))
                 } else {
-                    Err(anyhow!(res).context("Porkbun API returned unexpected response"))
+                    Err(eyre!("received unexpected response from Porkbun API: {json}"))
                 }
             },
         }

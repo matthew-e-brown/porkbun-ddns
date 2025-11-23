@@ -5,13 +5,17 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-anyhow = "1.0.100"
 chrono = "0.4.42"
 clap = { version = "4.5.49", features = ["derive", "cargo", "env", "wrap_help"] }
-dotenvy = "0.15.7"
+dotenvy = { version = "0.15.7", optional = true }
+eyre = "0.6.12"
 futures = "0.3.31"
 reqwest = { version = "0.12.23", features = ["blocking", "json"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 tokio = { version = "1.47.1", features = ["full"] }
 toml = "0.9.8"
+
+[features]
+default = ["dotenv"]
+dotenv = ["dep:dotenvy"]
