@@ -1,21 +1,28 @@
 [package]
-name = "porkbun-ddns"
+name = "porkbun_ddns"
 description = "A tool for updating Porkbun DNS A/AAAA records automatically"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+anstream = { version = "0.6.21", features = ["auto"] }
+anstyle = "1.0.13"
 chrono = "0.4.42"
 clap = { version = "4.5.49", features = ["derive", "cargo", "env", "wrap_help"] }
 dotenvy = { version = "0.15.7", optional = true }
 eyre = "0.6.12"
 futures = "0.3.31"
+log = { version = "0.4.28", features = ["std", "kv"] }
 reqwest = { version = "0.12.23", features = ["blocking", "json"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 tokio = { version = "1.47.1", features = ["full"] }
 toml = "0.9.8"
 
+[target.'cfg(unix)'.dependencies]
+systemd-journal-logger = { version = "2.2.2", optional = true }
+
 [features]
-default = ["dotenv"]
+default = ["dotenv", "journald"]
 dotenv = ["dep:dotenvy"]
+journald = ["dep:systemd-journal-logger"]

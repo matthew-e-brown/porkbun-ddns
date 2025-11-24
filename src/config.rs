@@ -96,8 +96,8 @@ impl Config {
     pub async fn load() -> eyre::Result<Self> {
         let args = Args::parse();
 
-        let text = fs::read_to_string(&args.cfg).await.wrap_err("failed to read file")?;
-        let mut config: Config = toml::from_str(&text).wrap_err("failed to parse file")?;
+        let text = fs::read_to_string(&args.config).await.wrap_err("Failed to read config file")?;
+        let mut config: Config = toml::from_str(&text).wrap_err("Failed to parse config file")?;
 
         config.extend_from_args(&args);
 
@@ -113,8 +113,9 @@ impl Config {
                 Entry::Occupied(entry) => {
                     let j = *entry.get();
                     let k = entry.key();
-                    return Err(eyre!("encountered multiple targets both for {k} (targets {j} and {i})")
-                        .wrap_err("invalid config"));
+                    return Err(
+                        eyre!("Found multiple targets for {k} (targets {j} and {i})").wrap_err("Invalid configuration")
+                    );
                 },
             }
         }

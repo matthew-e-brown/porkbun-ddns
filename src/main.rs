@@ -1,5 +1,6 @@
 mod api;
 mod config;
+mod logging;
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -10,38 +11,42 @@ use eyre::{WrapErr, eyre};
 use self::api::model::DNSRecord;
 use self::api::{IpAddrExt, PorkbunClient};
 use self::config::{Config, Target};
+use self::logging::Logger;
 
 #[tokio::main]
 pub async fn main() -> ExitCode {
-    let app = match App::init().await.wrap_err("application failed to start") {
+    Logger::new().init().expect("no other logger should have been set yet");
+
+    let app = match App::init().await {
         Ok(app) => app,
         Err(err) => {
-            report_error(err);
+            log::error!(target: "init", "{err:#}");
             return ExitCode::FAILURE;
         },
     };
 
-    let (ipv4, ipv6) = match app.get_addresses().await.wrap_err("failed to fetch IP address(es)") {
+    let (ipv4, ipv6) = match app.get_addresses().await.wrap_err("Failed to determine current IP address(es)") {
         // `get_addresses` will return two `None`s only if both are disabled. Otherwise, at least one is enabled,
         // meaning the only other option is for an error to have occurred or for at least one of them to be valid.
         Ok((None, None)) => {
-            println!("Both IPv4 and IPv6 are disabled. Nothing to do.");
+            log::info!(target: "init", "Both IPv4 and IPv6 are disabled. Nothing to do.");
             return ExitCode::SUCCESS;
         },
         Ok(addrs) => addrs,
         Err(err) => {
-            report_error(err);
+            log::error!(target: "init", "{err:#}");
             return ExitCode::FAILURE;
         },
     };
 
     match app.run(ipv4, ipv6).await {
         0 => {
-            println!("Done.");
+            log::info!(target: "main", "Done.");
             ExitCode::SUCCESS
         },
         n => {
-            eprintln!(
+            log::error!(
+                target: "main",
                 "Encountered {n} {errors}. See output for details.",
                 errors = if n == 1 { "error" } else { "errors" },
             );
@@ -51,9 +56,6 @@ pub async fn main() -> ExitCode {
     }
 }
 
-fn report_error(err: eyre::Report) {
-    todo!("error report: {err}");
-}
 
 /// The main application instance. Wraps both the program [`Config`] and a [`PorkbunClient`].
 ///
@@ -63,25 +65,35 @@ struct App {
     client: PorkbunClient,
 }
 
+/// Gets a variable from the environment or from a `.env` file.
 #[inline]
 #[cfg(feature = "dotenv")]
-fn get_var(key: &str) -> eyre::Result<String> {
-    dotenvy::var(key).wrap_err_with(|| format!("failed to load environment variable {key}"))
+fn get_var(key: &str) -> Result<String, dotenvy::Error> {
+    dotenvy::var(key)
 }
 
+/// Gets a variable from the environment.
 #[inline]
 #[cfg(not(feature = "dotenv"))]
-fn get_var(key: &str) -> eyre::Result<String> {
-    std::env::var(key).wrap_err_with(|| format!("failed to load environment variable {key}"))
+fn get_var(key: &str) -> Result<String, std::env::VarError> {
+    std::env::var(key)
+}
+
+/// Represents the possible outcomes for a single [`Target`].
+#[derive(Debug, Clone)]
+enum TargetResult<'a> {
+    Nothing { id: &'a str, old: IpAddr },
+    Edited { id: &'a str, old: IpAddr, new: IpAddr },
+    Created { id: String, new: IpAddr },
 }
 
 impl App {
     /// Initializes the application instance.
     pub async fn init() -> eyre::Result<Self> {
-        let config = Config::load().await.wrap_err("failed to load config")?;
+        let config = Config::load().await?;
 
-        let api_key = get_var("PORKBUN_API_KEY")?;
-        let secret_key = get_var("PORKBUN_SECRET_KEY")?;
+        let api_key = get_var("PORKBUN_API_KEY").wrap_err("Failed to get PORKBUN_API_KEY from environment")?;
+        let secret_key = get_var("PORKBUN_SECRET_KEY").wrap_err("Failed to get PORKBUN_SECRET_KEY from environment")?;
         let client = PorkbunClient::new(api_key, secret_key);
 
         Ok(Self { config, client })
@@ -113,7 +125,7 @@ impl App {
                 if self.config.ipv6 {
                     // If IPv6 is set to hard-error mode, or if IPv6 is the only one enabled, this is an error.
                     if self.config.ipv6_error || !self.config.ipv4 {
-                        return Err(eyre!("failed to get IPv6 address from Porkbun API"));
+                        return Err(eyre!("Failed to get IPv6 address from Porkbun API"));
                     }
 
                     // If the non-IPv4 endpoint gave us IPv4, then we can't get an IPv6. We don't even need to try.
@@ -180,8 +192,7 @@ impl App {
                     Ok(())
                 },
                 Err(err) => {
-                    let err = err.wrap_err(format!("failed to fetch DNS records for domain {domain}"));
-                    report_error(err);
+                    log::error!(target: "fetch_records", "Failed to fetch DNS records for domain: {err:#}");
                     Err(())
                 },
             }
@@ -218,12 +229,25 @@ impl App {
                 let addrs = [ipv4.map(IpAddr::V4), ipv6.map(IpAddr::V6)];
                 let tasks = addrs.into_iter().filter_map(move |addr| {
                     addr.map(async move |addr| -> Result<(), ()> {
-                        if let Err(err) = self.handle_target(i, target, records, addr).await {
-                            let msg = format!("target {i} ({}) failed", target.label());
-                            report_error(err.wrap_err(msg));
-                            Err(())
-                        } else {
-                            Ok(())
+                        match self.handle_target(target, records, addr).await {
+                            Ok(TargetResult::Nothing { id, old }) => {
+                                log::info!(""); // [TODO]
+                                Ok(())
+                            },
+                            Ok(TargetResult::Edited { id, old, new }) => {
+                                log::info!(""); // [TODO]
+                                Ok(())
+                            },
+                            Ok(TargetResult::Created { id, new }) => {
+                                log::info!(""); // [TODO]
+                                Ok(())
+                            },
+                            Err(err) => {
+                                // let msg = format!("target {i} ({}) failed", target.label());
+                                // report_error(err.wrap_err(msg));
+                                log::error!(target: "run_target", "");
+                                Err(())
+                            },
                         }
                     })
                 });
@@ -243,7 +267,12 @@ impl App {
         err_count
     }
 
-    async fn handle_target(&self, i: usize, target: &Target, records: &[DNSRecord], addr: IpAddr) -> eyre::Result<()> {
+    async fn handle_target<'a>(
+        &self,
+        target: &Target,
+        records: &'a [DNSRecord],
+        addr: IpAddr,
+    ) -> eyre::Result<TargetResult<'a>> {
         // Check if any of the existing records for this target's domain actually match the target precisely:
         let mut matching_records = records
             .iter()
@@ -255,95 +284,48 @@ impl App {
         // There's probably some elegant way to handle multiple records existing for the same target. For now...
         // we'll let the user handle this.
         if num_left > 0 {
-            return Err(eyre!("multiple existing DNS records match target, unsure which to update"));
+            return Err(eyre!("Multiple existing DNS records match target, unsure which to update"));
         }
 
-        match existing {
+        if let Some(record) = existing {
+            // Check what the IP address is on the existing record
+            let record_addr = record
+                .content
+                .parse::<IpAddr>()
+                .wrap_err("Existing DNS record has invalid IP address")?;
+
+            if record.typ != record_addr.dns_type() {
+                return Err(eyre!("Existing DNS record's IP address type does not match its record type"));
+            }
+
             // If the address on the record matches our current address, we don't need to update anything.
-            Some(record) if ip_matches(record, addr)? => self.do_nothing(i, target, record).await,
-            // If there is otherwise an existing record, we need to edit it.
-            Some(record) => self.edit_record(i, target, record, addr).await,
-            // Otherwise, we need to create a new one.
-            None => self.create_record(i, target, addr).await,
-        }
-    }
+            if record_addr == addr {
+                Ok(TargetResult::Nothing { id: &record.id[..], old: addr })
+            } else {
+                let id = &record.id[..];
 
-    // [TODO] Tidy the whole "reporting" situation up. Sort of in-between rewrites here, so:
-    //
-    // - Currently there is both `target.label()` for just getting the domain name, plus this function with extra
-    //   formatting on main log lines
-    // - Reported errors use a different formatting for targets than regular log output.
-    //
-    // We'll have to deal with this messiness later.
+                if !self.config.dry_run {
+                    self.client
+                        .edit_record(target, id, addr)
+                        .await
+                        .wrap_err("Failed to edit DNS record")?;
+                }
 
-    /// Gets a print-friendly label for the given target, representing how it was provided in the config file (e.g.,
-    /// this will return "@.domain.com" even though "@" is usually transparent). Used for log output lines.
-    fn fmt_label(&self, i: usize, target: &Target) -> String {
-        let mut label = match target.subdomain() {
-            Some(sub) => format!("[{i}: {sub}.{}]", target.domain()),
-            None => format!("[{i}: {}]", target.domain()),
-        };
-
-        if self.config.dry_run {
-            label += " [DRY RUN]";
-        }
-
-        label
-    }
-
-    async fn do_nothing(&self, i: usize, target: &Target, record: &DNSRecord) -> eyre::Result<()> {
-        let DNSRecord { typ, id, content, .. } = record;
-        let label = self.fmt_label(i, target);
-        println!("{label} Found existing {typ} record #{id} with content {content}.",);
-        println!("{label} Nothing to do.");
-        Ok(())
-    }
-
-    async fn edit_record(&self, i: usize, target: &Target, record: &DNSRecord, new_addr: IpAddr) -> eyre::Result<()> {
-        let DNSRecord { typ, id, content, .. } = record;
-        let label = self.fmt_label(i, target);
-        println!("{label} Found existing {typ} record #{id} with content {content}.");
-
-        if !self.config.dry_run {
-            self.client
-                .edit_record(target, &record.id, new_addr)
-                .await
-                .wrap_err("failed to edit DNS record")?;
-        }
-
-        println!("{label} Edited record #{id} content from {content} to {new_addr}.");
-        Ok(())
-    }
-
-    async fn create_record(&self, i: usize, target: &Target, new_addr: IpAddr) -> eyre::Result<()> {
-        let label = self.fmt_label(i, target);
-        println!("{label} Did not find existing {} record.", new_addr.dns_type());
-
-        let id;
-        if !self.config.dry_run {
-            id = self
-                .client
-                .create_record(target, new_addr)
-                .await
-                .wrap_err("failed to create DNS record")?;
+                Ok(TargetResult::Edited { id, old: record_addr, new: addr })
+            }
         } else {
-            id = "<record_id>".to_string();
+            let id;
+            if !self.config.dry_run {
+                id = self
+                    .client
+                    .create_record(target, addr)
+                    .await
+                    .wrap_err("Failed to create DNS record")?;
+            } else {
+                id = "<record_id>".to_string();
+            };
+
+            Ok(TargetResult::Created { id, new: addr })
         }
-
-        println!("{label} Created new record #{id} with content {new_addr}.");
-        Ok(())
-    }
-}
-
-/// Checks if the actual content of the given record matches the current IP address.
-fn ip_matches(record: &DNSRecord, current_addr: IpAddr) -> eyre::Result<bool> {
-    let record_addr = record
-        .content
-        .parse::<IpAddr>()
-        .wrap_err("existing DNS record has invalid IP address")?;
-    if record.typ != record_addr.dns_type() {
-        Err(eyre!("existing DNS record's IP address type does not match its record type"))
-    } else {
-        Ok(current_addr == record_addr)
     }
 }

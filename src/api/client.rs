@@ -1,4 +1,5 @@
 use std::net::{IpAddr, Ipv4Addr};
+use std::sync::LazyLock;
 
 use chrono::Local;
 use eyre::{WrapErr, eyre};
@@ -11,21 +12,23 @@ use super::{BASE_URL, BASE_URL_V4, IpAddrExt};
 use crate::api::model::CreatedRecord;
 use crate::config::Target;
 
-type JsonObject = JsonMap<String, JsonValue>;
-
-/// Formats the full URL for an API endpoint into just its endpoint.
-#[inline]
-fn fmt_endpoint(url: &str) -> &str {
-    url.starts_with(BASE_URL).then(|| &url[BASE_URL.len() + 1..]).unwrap_or(url)
-}
-
-/// The access point to the Porkbun API.
+/// Main access point to the Porkbun API.
 #[derive(Debug)]
 pub struct PorkbunClient {
     reqwest: reqwest::Client,
     api_key: String,
     secret_key: String,
 }
+
+/// Timestamp format for DNS records. Format is `Sun Jul 8 2001 at 8:46:23 PM`.
+static TIMESTAMP_FMT: LazyLock<&'static [chrono::format::Item<'static>]> = LazyLock::new(|| {
+    // NB: `LazyLock`'s own docs have a note about how static items don't ever get dropped, so leaking this Vec into a
+    // static slice doesn't make any difference in that regard.
+    chrono::format::StrftimeItems::new("%a %b %-d %Y at %-I:%M:%S %p")
+        .parse_to_owned()
+        .expect("hardcoded strftime string should be valid")
+        .leak()
+});
 
 impl PorkbunClient {
     pub fn new(api_key: String, secret_key: String) -> Self {
@@ -50,10 +53,7 @@ impl PorkbunClient {
     /// Porkbun may return either an IPv4 or IPv6 address; see [`ping_v4`][Self::ping_v4].
     pub async fn ping(&self) -> eyre::Result<IpAddr> {
         let url = format!("{BASE_URL}/ping");
-        let res = self
-            .request::<Ping>(&url, None)
-            .await
-            .wrap_err_with(|| format!("API request to {} failed", fmt_endpoint(&url)))?;
+        let res = self.request::<Ping>(&url, None).await?;
         Ok(res.your_ip)
     }
 
@@ -61,10 +61,7 @@ impl PorkbunClient {
     /// subdomain.
     pub async fn ping_v4(&self) -> eyre::Result<Ipv4Addr> {
         let url = format!("{BASE_URL_V4}/ping");
-        let res = self
-            .request::<Ping>(&url, None)
-            .await
-            .wrap_err_with(|| format!("API request to {} failed", fmt_endpoint(&url)))?;
+        let res = self.request::<Ping>(&url, None).await?;
         // What happens if a system *only* has IPv6? Will the IPv4 /ping return an error?
         // ...I don't really have a way to test that.
         match res.your_ip {
@@ -76,16 +73,13 @@ impl PorkbunClient {
     /// Gets all the existing records for the given domain name.
     pub async fn get_existing_records(&self, domain: &str) -> eyre::Result<Vec<DNSRecord>> {
         let url = format!("{BASE_URL}/dns/retrieve/{domain}");
-        let res = self
-            .request::<DNSRecordList>(&url, None)
-            .await
-            .wrap_err_with(|| format!("API request to {} failed", fmt_endpoint(&url)))?;
+        let res = self.request::<DNSRecordList>(&url, None).await?;
         Ok(res.records)
     }
 
     /// Creates the JSON payload for creating or editing a DNS record.
     fn make_dns_payload(target: &Target, content: IpAddr) -> JsonValue {
-        let time = Local::now().format("%a %b %-d %Y at %I:%M:%S %p");
+        let timestamp = Local::now().format_with_items(TIMESTAMP_FMT.iter());
         json!({
             // In both create and edit payloads, the `name` field only includes the subdomain:
             // - https://porkbun.com/api/json/v3/documentation#DNS%20Create%20Record
@@ -97,7 +91,7 @@ impl PorkbunClient {
             "type": content.dns_type(),
             "content": content,
             "ttl": target.ttl(),
-            "notes": format!("Last updated by {} on {time}", env!("CARGO_PKG_NAME")),
+            "notes": format!("Last updated by {} on {timestamp}", env!("CARGO_PKG_NAME")),
         })
     }
 
@@ -108,9 +102,7 @@ impl PorkbunClient {
     pub async fn edit_record(&self, target: &Target, record_id: &str, new_content: IpAddr) -> eyre::Result<()> {
         let url = format!("{BASE_URL}/dns/edit/{}/{}", target.domain(), record_id);
         let payload = Self::make_dns_payload(target, new_content);
-        self.request::<()>(&url, Some(payload))
-            .await
-            .wrap_err_with(|| format!("API request to {} failed", fmt_endpoint(&url)))
+        self.request::<()>(&url, Some(payload)).await
     }
 
     /// Creates a new DNS record for the given target with the given content.
@@ -119,10 +111,7 @@ impl PorkbunClient {
     pub async fn create_record(&self, target: &Target, content: IpAddr) -> eyre::Result<String> {
         let url = format!("{BASE_URL}/dns/create/{}", target.domain());
         let payload = Self::make_dns_payload(target, content);
-        let res = self
-            .request::<CreatedRecord>(&url, Some(payload))
-            .await
-            .wrap_err_with(|| format!("API request to {} failed", fmt_endpoint(&url)))?;
+        let res = self.request::<CreatedRecord>(&url, Some(payload)).await?;
         Ok(res.id)
     }
 
@@ -149,8 +138,8 @@ impl PorkbunClient {
             .send()
             .await
             .wrap_err("POST request failed")?;
-        let res_text = res_raw.text().await.wrap_err("could not read POST response body")?;
-        let res_json = serde_json::from_str(&res_text[..]).wrap_err("received invalid JSON from Porkbun API")?;
+        let res_text = res_raw.text().await.wrap_err("Could not read POST response body")?;
+        let res_json = serde_json::from_str(&res_text[..]).wrap_err("Received invalid JSON from Porkbun API")?;
 
         // All Porkbun endpoints should return objects with a 'status'
         match res_json {
@@ -158,7 +147,7 @@ impl PorkbunClient {
                 map.remove("status");
                 // Now that we've removed 'status', parse the rest of it
                 let parsed = serde_json::from_value(JsonValue::Object(map))
-                    .wrap_err("could not parse JSON response from Porkbun API into valid type")?;
+                    .wrap_err("Could not parse JSON response from Porkbun API into valid type")?;
                 Ok(parsed)
             },
             mut json => {
@@ -172,22 +161,23 @@ impl PorkbunClient {
                         unreachable!();
                     };
 
-                    Err(eyre!(msg).wrap_err("received error from Porkbun API"))
+                    Err(eyre!("Received an error from Porkbun: {msg}"))
                 } else {
-                    Err(eyre!("received unexpected response from Porkbun API: {json}"))
+                    Err(eyre!("Received an unexpected response from Porkbun: {json}"))
                 }
             },
         }
     }
 }
 
+/// Extension trait for Json `{}` objects.
 trait JsonObjectExt {
     /// Combines [`JsonMap::get`] and [`JsonValue::as_str`] into one method that only returns the value if it both
     /// exists and is a string.
     fn get_str(&self, key: &str) -> Option<&str>;
 }
 
-impl JsonObjectExt for JsonObject {
+impl JsonObjectExt for JsonMap<String, JsonValue> {
     #[inline]
     fn get_str(&self, key: &str) -> Option<&str> {
         self.get(key).and_then(JsonValue::as_str)
