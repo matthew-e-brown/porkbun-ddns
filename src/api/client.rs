@@ -52,6 +52,7 @@ impl PorkbunClient {
     ///
     /// Porkbun may return either an IPv4 or IPv6 address; see [`ping_v4`][Self::ping_v4].
     pub async fn ping(&self) -> eyre::Result<IpAddr> {
+        log::trace!("Sending ping");
         let url = format!("{BASE_URL}/ping");
         let res = self.request::<Ping>(&url, None).await?;
         Ok(res.your_ip)
@@ -60,6 +61,7 @@ impl PorkbunClient {
     /// Determine this system's current IPv4 address using Porkbun's `/ping` endpoint on the `api-ipv4.porkbun.com`
     /// subdomain.
     pub async fn ping_v4(&self) -> eyre::Result<Ipv4Addr> {
+        log::trace!("Sending ping to IPv4 endpoint");
         let url = format!("{BASE_URL_V4}/ping");
         let res = self.request::<Ping>(&url, None).await?;
         // What happens if a system *only* has IPv6? Will the IPv4 /ping return an error?
@@ -72,6 +74,7 @@ impl PorkbunClient {
 
     /// Gets all the existing records for the given domain name.
     pub async fn get_existing_records(&self, domain: &str) -> eyre::Result<Vec<DNSRecord>> {
+        log::trace!("Getting existing records for domain {domain}");
         let url = format!("{BASE_URL}/dns/retrieve/{domain}");
         let res = self.request::<DNSRecordList>(&url, None).await?;
         Ok(res.records)
@@ -100,6 +103,7 @@ impl PorkbunClient {
     /// `record_id` must be fetched beforehand. It is not double checked to match Porkbun's API status before sending
     /// the request.
     pub async fn edit_record(&self, target: &Target, record_id: &str, new_content: IpAddr) -> eyre::Result<()> {
+        log::trace!("Editing record {record_id} for target {target} with new content \"{new_content}\"");
         let url = format!("{BASE_URL}/dns/edit/{}/{}", target.domain(), record_id);
         let payload = Self::make_dns_payload(target, new_content);
         self.request::<()>(&url, Some(payload)).await
@@ -109,6 +113,7 @@ impl PorkbunClient {
     ///
     /// Returns the ID of the newly created record.
     pub async fn create_record(&self, target: &Target, content: IpAddr) -> eyre::Result<String> {
+        log::trace!("Creating new record for target {target} with new content \"{content}\"");
         let url = format!("{BASE_URL}/dns/create/{}", target.domain());
         let payload = Self::make_dns_payload(target, content);
         let res = self.request::<CreatedRecord>(&url, Some(payload)).await?;
@@ -120,6 +125,8 @@ impl PorkbunClient {
     where
         R: DeserializeOwned,
     {
+        log::trace!("Sending POST request to {url} with payload {payload:?}");
+
         let mut payload = match payload {
             Some(JsonValue::Object(map)) => map,
             Some(JsonValue::Null) | None => JsonMap::<String, JsonValue>::new(),
@@ -138,7 +145,10 @@ impl PorkbunClient {
             .send()
             .await
             .wrap_err("POST request failed")?;
-        let res_text = res_raw.text().await.wrap_err("Could not read POST response body")?;
+
+        let res_text = res_raw.text().await.wrap_err("Failed to read POST response body")?;
+        log::trace!("Received POST response of size {} bytes", res_text.len());
+
         let res_json = serde_json::from_str(&res_text[..]).wrap_err("Received invalid JSON from Porkbun API")?;
 
         // All Porkbun endpoints should return objects with a 'status'
@@ -161,9 +171,9 @@ impl PorkbunClient {
                         unreachable!();
                     };
 
-                    Err(eyre!("Received an error from Porkbun: {msg}"))
+                    Err(eyre!("Received error from Porkbun API: \"{msg}\""))
                 } else {
-                    Err(eyre!("Received an unexpected response from Porkbun: {json}"))
+                    Err(eyre!("Received unexpected response from Porkbun API: {json}"))
                 }
             },
         }

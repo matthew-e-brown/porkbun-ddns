@@ -1,7 +1,10 @@
 use std::net::IpAddr;
 
+use eyre::eyre;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
+
+use super::IpAddrExt;
 
 
 /// Current IP address as returned by Porkbun's `/ping` endpoint.
@@ -38,6 +41,27 @@ pub struct DNSRecord {
     #[serde(with = "optional_or_stringified_number")]
     pub prio: Option<u32>,
     pub notes: Option<String>,
+}
+
+impl DNSRecord {
+    /// Attempts to parse an IP address out of this DNS record's [`content`][Self::content] field.
+    ///
+    /// Returns an error if the IP address is not valid, if this is not an A/AAAA record, or if the type of IP address
+    /// does not match what is expected for the record's type.
+    pub fn try_parse_ip(&self) -> eyre::Result<IpAddr> {
+        if !(self.typ == "A" || self.typ == "AAAA") {
+            return Err(eyre!("cannot parse IP address from record with type {}", self.typ));
+        }
+
+        let addr = self.content.parse::<IpAddr>()?;
+        if addr.dns_type() != self.typ {
+            let exp = if self.typ == "A" { "IPv4" } else { "IPv6" };
+            let acc = if addr.is_ipv4() { "IPv4" } else { "IPv6" };
+            Err(eyre!("record of type {} has the wrong IP address type (should have {exp}, has {acc})", self.typ))
+        } else {
+            Ok(addr)
+        }
+    }
 }
 
 mod optional_or_stringified_number {

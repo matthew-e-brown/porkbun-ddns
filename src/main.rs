@@ -13,6 +13,13 @@ use self::api::{IpAddrExt, PorkbunClient};
 use self::config::{Config, Target};
 use self::logging::Logger;
 
+/// Formatting helper for log and error messages
+macro_rules! pluralize {
+    ($single:expr, $plural:expr, $count:expr) => {
+        if $count == 1 { $single } else { $plural }
+    };
+}
+
 #[tokio::main]
 pub async fn main() -> ExitCode {
     Logger::new().init().expect("no other logger should have been set yet");
@@ -20,37 +27,35 @@ pub async fn main() -> ExitCode {
     let app = match App::init().await {
         Ok(app) => app,
         Err(err) => {
-            log::error!(target: "init", "{err:#}");
+            log::error!("{err:#}");
             return ExitCode::FAILURE;
         },
     };
 
-    let (ipv4, ipv6) = match app.get_addresses().await.wrap_err("Failed to determine current IP address(es)") {
+    let (ipv4, ipv6) = match app.get_addresses().await {
         // `get_addresses` will return two `None`s only if both are disabled. Otherwise, at least one is enabled,
         // meaning the only other option is for an error to have occurred or for at least one of them to be valid.
         Ok((None, None)) => {
-            log::info!(target: "init", "Both IPv4 and IPv6 are disabled. Nothing to do.");
+            log::info!("Both IPv4 and IPv6 are disabled. Nothing to do.");
             return ExitCode::SUCCESS;
         },
         Ok(addrs) => addrs,
         Err(err) => {
-            log::error!(target: "init", "{err:#}");
+            log::error!(
+                "Failed to determine current IP {addresses}: {err:#}",
+                addresses = pluralize!("address", "addresses", app.config.num_enabled()),
+            );
             return ExitCode::FAILURE;
         },
     };
 
     match app.run(ipv4, ipv6).await {
         0 => {
-            log::info!(target: "main", "Done.");
+            log::info!("Done.");
             ExitCode::SUCCESS
         },
         n => {
-            log::error!(
-                target: "main",
-                "Encountered {n} {errors}. See output for details.",
-                errors = if n == 1 { "error" } else { "errors" },
-            );
-
+            log::error!("Encountered {n} {errors}. See output for details.", errors = pluralize!("error", "errors", n));
             ExitCode::FAILURE
         },
     }
@@ -79,32 +84,28 @@ fn get_var(key: &str) -> Result<String, std::env::VarError> {
     std::env::var(key)
 }
 
-/// Represents the possible outcomes for a single [`Target`].
-#[derive(Debug, Clone)]
-enum TargetResult<'a> {
-    Nothing { id: &'a str, old: IpAddr },
-    Edited { id: &'a str, old: IpAddr, new: IpAddr },
-    Created { id: String, new: IpAddr },
-}
-
 impl App {
     /// Initializes the application instance.
     pub async fn init() -> eyre::Result<Self> {
+        log::debug!("Initializing...");
+
         let config = Config::load().await?;
 
+        log::trace!("Loading API keys from environment");
         let api_key = get_var("PORKBUN_API_KEY").wrap_err("Failed to get PORKBUN_API_KEY from environment")?;
         let secret_key = get_var("PORKBUN_SECRET_KEY").wrap_err("Failed to get PORKBUN_SECRET_KEY from environment")?;
         let client = PorkbunClient::new(api_key, secret_key);
 
+        log::debug!("Initialization successful.");
         Ok(Self { config, client })
     }
 
     /// Fetches IPv4 and IPv6 addresses for the current system.
     pub async fn get_addresses(&self) -> eyre::Result<(Option<Ipv4Addr>, Option<Ipv6Addr>)> {
-        let num_enabled = self.config.ipv4 as usize + self.config.ipv6 as usize;
-        println!(
-            "Fetching current IP {addresses}...",
-            addresses = if num_enabled == 1 { "address" } else { "addresses" },
+        let num_enabled = self.config.num_enabled();
+        log::debug!(
+            "Pinging Porkbun API for current IP {addresses}...",
+            addresses = pluralize!("address", "addresses", num_enabled),
         );
 
         if num_enabled == 0 {
@@ -118,30 +119,30 @@ impl App {
         match self.client.ping().await? {
             IpAddr::V4(addr) => {
                 if self.config.ipv4 {
-                    println!("Got IPv4 address: {addr}");
+                    log::info!("Found current IPv4 address: {addr}");
                     ipv4 = Some(addr);
                 }
 
                 if self.config.ipv6 {
                     // If IPv6 is set to hard-error mode, or if IPv6 is the only one enabled, this is an error.
                     if self.config.ipv6_error || !self.config.ipv4 {
-                        return Err(eyre!("Failed to get IPv6 address from Porkbun API"));
+                        return Err(eyre!("Tried to get IPv6 address from Porkbun API, but only got IPv4"));
                     }
 
                     // If the non-IPv4 endpoint gave us IPv4, then we can't get an IPv6. We don't even need to try.
-                    println!("Got IPv6 address: none.");
+                    log::info!("Found current IPv6 address: none.");
                 }
             },
             IpAddr::V6(addr) => {
                 if self.config.ipv6 {
-                    println!("Got IPv6 address: {addr}");
+                    log::info!("Found current IPv6 address: {addr}");
                     ipv6 = Some(addr);
                 }
 
                 if self.config.ipv4 {
-                    println!("Pinging again for IPv4 address...");
+                    log::debug!("Pinging again for IPv4 address...");
                     let addr = self.client.ping_v4().await?;
-                    println!("Got IPv4 address: {addr}");
+                    log::info!("Found current IPv4 address: {addr}");
                     ipv4 = Some(addr);
                 }
             },
@@ -156,6 +157,10 @@ impl App {
     /// Instead, this method handles logging/reporting all errors that occur over the course of the entire operation.
     /// Then, the total number of errors is returned.
     pub async fn run(&self, ipv4: Option<Ipv4Addr>, ipv6: Option<Ipv6Addr>) -> usize {
+        if self.config.dry_run {
+            log::warn!("dry_run is enabled: no create/edit requests will be sent through to Porkbun.");
+        }
+
         // Used for printing more accurate log messages.
         let search_type = match (ipv4, ipv6) {
             (Some(_), None) => "A",
@@ -179,6 +184,12 @@ impl App {
             current_records.entry(domain).or_insert_with(|| [].into());
         }
 
+        log::debug!(
+            "Checking Porkbun for existing DNS records on {} unique {domains}...",
+            current_records.len(),
+            domains = pluralize!("domain", "domains", current_records.len()),
+        );
+
         let record_tasks = current_records.iter_mut().map(async |(domain, records)| -> Result<(), ()> {
             match self.client.get_existing_records(domain).await {
                 Ok(mut existing) => {
@@ -188,11 +199,14 @@ impl App {
                     let count = existing.len();
                     *records = existing.into_boxed_slice();
 
-                    println!("Found {count} {search_type} records for {domain}.");
+                    log::debug!(
+                        "Found {count} {search_type} {records} for {domain}.",
+                        records = pluralize!("record", "records", count)
+                    );
                     Ok(())
                 },
                 Err(err) => {
-                    log::error!(target: "fetch_records", "Failed to fetch DNS records for domain: {err:#}");
+                    log::error!("Failed to fetch DNS records for {domain}: {err:#}");
                     Err(())
                 },
             }
@@ -211,15 +225,11 @@ impl App {
             .config
             .targets
             .iter()
-            .enumerate()
-            .filter_map(|(i, target)| {
-                let i = i + 1; // 1-based indexing
-
+            .filter_map(|target| {
                 let Some(records) = current_records.get(target.domain()) else {
                     // Target's records might be missing if we previously failed to fetch them. Error would've already
-                    // been logged in that case, so we don't need to report another one. Just a regular print is fine.
-                    println!("target {i} ({}) skipped due to missing DNS records", target.label());
-
+                    // been logged in that case, so we don't need to report another one.
+                    log::warn!("{target}: Skipped due to missing DNS records.");
                     // Skip over this target in the outer `filter_map`.
                     return None;
                 };
@@ -230,22 +240,9 @@ impl App {
                 let tasks = addrs.into_iter().filter_map(move |addr| {
                     addr.map(async move |addr| -> Result<(), ()> {
                         match self.handle_target(target, records, addr).await {
-                            Ok(TargetResult::Nothing { id, old }) => {
-                                log::info!(""); // [TODO]
-                                Ok(())
-                            },
-                            Ok(TargetResult::Edited { id, old, new }) => {
-                                log::info!(""); // [TODO]
-                                Ok(())
-                            },
-                            Ok(TargetResult::Created { id, new }) => {
-                                log::info!(""); // [TODO]
-                                Ok(())
-                            },
+                            Ok(()) => Ok(()),
                             Err(err) => {
-                                // let msg = format!("target {i} ({}) failed", target.label());
-                                // report_error(err.wrap_err(msg));
-                                log::error!(target: "run_target", "");
+                                log::error!("{target}: {err:#}");
                                 Err(())
                             },
                         }
@@ -267,16 +264,11 @@ impl App {
         err_count
     }
 
-    async fn handle_target<'a>(
-        &self,
-        target: &Target,
-        records: &'a [DNSRecord],
-        addr: IpAddr,
-    ) -> eyre::Result<TargetResult<'a>> {
+    async fn handle_target<'a>(&self, target: &Target, records: &'a [DNSRecord], addr: IpAddr) -> eyre::Result<()> {
+        let dns_type = addr.dns_type();
+
         // Check if any of the existing records for this target's domain actually match the target precisely:
-        let mut matching_records = records
-            .iter()
-            .filter(|rec| rec.typ == addr.dns_type() && target.record_matches(rec));
+        let mut matching_records = records.iter().filter(|rec| rec.typ == dns_type && target.record_matches(rec));
 
         let existing = matching_records.next();
         let num_left = matching_records.count();
@@ -284,26 +276,22 @@ impl App {
         // There's probably some elegant way to handle multiple records existing for the same target. For now...
         // we'll let the user handle this.
         if num_left > 0 {
-            return Err(eyre!("Multiple existing DNS records match target, unsure which to update"));
+            return Err(eyre!("Multiple existing {dns_type} records matched target, unsure which to update"));
         }
 
         if let Some(record) = existing {
-            // Check what the IP address is on the existing record
-            let record_addr = record
-                .content
-                .parse::<IpAddr>()
-                .wrap_err("Existing DNS record has invalid IP address")?;
+            let id = &record.id[..];
 
-            if record.typ != record_addr.dns_type() {
-                return Err(eyre!("Existing DNS record's IP address type does not match its record type"));
-            }
+            // Check what the IP address is on the existing record
+            let existing_addr = record
+                .try_parse_ip()
+                .wrap_err_with(|| format!("Found matching {dns_type} record #{id}, but it was malformed"))?;
 
             // If the address on the record matches our current address, we don't need to update anything.
-            if record_addr == addr {
-                Ok(TargetResult::Nothing { id: &record.id[..], old: addr })
+            if existing_addr == addr {
+                log::info!("{target}: Nothing to do. Found existing {dns_type} record #{id} with content {addr}.");
+                Ok(())
             } else {
-                let id = &record.id[..];
-
                 if !self.config.dry_run {
                     self.client
                         .edit_record(target, id, addr)
@@ -311,7 +299,8 @@ impl App {
                         .wrap_err("Failed to edit DNS record")?;
                 }
 
-                Ok(TargetResult::Edited { id, old: record_addr, new: addr })
+                log::info!("{target}: Edited existing {dns_type} record #{id} from {existing_addr} to {addr}.");
+                Ok(())
             }
         } else {
             let id;
@@ -323,9 +312,10 @@ impl App {
                     .wrap_err("Failed to create DNS record")?;
             } else {
                 id = "<record_id>".to_string();
-            };
+            }
 
-            Ok(TargetResult::Created { id, new: addr })
+            log::info!("{target}: Created new {dns_type} record #{id} with content {addr}.");
+            Ok(())
         }
     }
 }

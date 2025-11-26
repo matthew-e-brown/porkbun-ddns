@@ -99,11 +99,19 @@ impl Logger {
 
     /// Fallible version of [`Log::log`] to enable the use of `?` within.
     fn try_log(&self, record: &log::Record) -> io::Result<()> {
+        // Only log our own messages; hide implementation details (reqwest also has logging)
+        if !record.target().starts_with(env!("CARGO_PKG_NAME")) {
+            return Ok(());
+        }
+
         if !self.enabled(record.metadata()) {
             return Ok(());
         }
 
         // If we have a journald connection, forward the message directly there instead of printing it ourselves.
+        // [TODO] Decide if I want to do my own level filtering first, or if I just want to forward everything on to
+        //        journald and then do filtering there. Filtering myself first will help keep logs small for a service
+        //        that runs so often (every 15-30 minutes).
         #[cfg(all(unix, feature = "journald"))]
         if let Some(journald) = self.journald.as_ref() {
             return journald.journal_send(record); // Also returns io::Result
@@ -114,16 +122,20 @@ impl Logger {
 
         #[rustfmt::skip]
         let (style, tag) = match record.level() {
-            Level::Trace => (styles::TRACE, "[trace]:"),
-            Level::Debug => (styles::DEBUG, "[debug]:"),
-            Level::Info  => ( styles::INFO, "[info]:"),
-            Level::Warn  => ( styles::WARN, "[warn]:"),
-            Level::Error => (styles::ERROR, "[error]:"),
+            Level::Trace => (styles::TRACE, "[trace]"),
+            Level::Debug => (styles::DEBUG, "[debug]"),
+            Level::Info  => ( styles::INFO, "[info]"),
+            Level::Warn  => ( styles::WARN, "[warn]"),
+            Level::Error => (styles::ERROR, "[error]"),
         };
 
         if self.timestamps {
             let timestamp = Local::now().format_with_items(TIMESTAMP_FMT.iter());
             write!(output, "{timestamp} ")?;
+        }
+
+        if !record.target().is_empty() {
+            write!(output, "{} ", record.target())?;
         }
 
         writeln!(output, "{style}{tag} {}{style:#}", record.args())?;

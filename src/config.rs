@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+use std::fmt::Display;
 use std::path::PathBuf;
 
 use clap::Parser;
@@ -94,28 +95,34 @@ pub struct Config {
 impl Config {
     /// Loads runtime configuration from command line arguments and configuration file.
     pub async fn load() -> eyre::Result<Self> {
+        log::trace!("Parsing command line arguments");
         let args = Args::parse();
+
+        if log::log_enabled!(log::Level::Trace) {
+            log::trace!("Reading configuration from {}", &args.config.to_string_lossy());
+        }
 
         let text = fs::read_to_string(&args.config).await.wrap_err("Failed to read config file")?;
         let mut config: Config = toml::from_str(&text).wrap_err("Failed to parse config file")?;
 
         config.extend_from_args(&args);
 
+        log::trace!("Final config: {config:?}");
+
         // Check that all targets are unique:
         let mut tgt_labels = HashMap::with_capacity(config.targets.len());
         let mut i = 0;
         for tgt in &config.targets {
             i += 1;
-            match tgt_labels.entry(tgt.label()) {
+            match tgt_labels.entry(tgt.to_string()) {
                 Entry::Vacant(entry) => {
                     entry.insert(i);
                 },
                 Entry::Occupied(entry) => {
                     let j = *entry.get();
                     let k = entry.key();
-                    return Err(
-                        eyre!("Found multiple targets for {k} (targets {j} and {i})").wrap_err("Invalid configuration")
-                    );
+                    return Err(eyre!("Target {k} specified more than once (targets {j} and {i})")
+                        .wrap_err("Invalid configuration"));
                 },
             }
         }
@@ -140,6 +147,13 @@ impl Config {
         }
 
         // ...other future settings.
+    }
+
+    /// Returns the number of IP address modes that are enabled (0, 1, or 2).
+    ///
+    /// Used mostly as a convenience for formatting.
+    pub const fn num_enabled(&self) -> usize {
+        self.ipv4 as usize + self.ipv6 as usize
     }
 }
 
@@ -189,15 +203,25 @@ impl Target {
         }
     }
 
-    /// Gets a print-friendly label for this [target][Target] that represents how it was specified in the config file.
-    ///
-    /// For example, if a target is specified using `@` to refer to the root domain, this method will return
-    /// `@.domain.com`, even though what we send Porkbun's API looks like `domain.com`.
-    pub fn label(&self) -> String {
-        match self.subdomain() {
-            Some(sub) => format!("{sub}.{}", self.domain()),
-            None => self.domain().to_string(),
+    // /// Gets a print-friendly label for this [target][Target] that represents how it was specified in the config file.
+    // ///
+    // /// For example, if a target is specified using `@` to refer to the root domain, this method will return
+    // /// `@.domain.com`, even though what we send Porkbun's API looks like `domain.com`.
+    // pub fn label(&self) -> String {
+    //     match self.subdomain() {
+    //         Some(sub) => format!("{sub}.{}", self.domain()),
+    //         None => self.domain().to_string(),
+    //     }
+    // }
+}
+
+/// Formats the target as a
+impl Display for Target {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(sub) = self.subdomain() {
+            write!(f, "{sub}.")?;
         }
+        write!(f, "{}", self.domain())
     }
 }
 
