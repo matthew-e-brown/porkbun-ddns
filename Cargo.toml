@@ -1,7 +1,8 @@
 [package]
-name = "porkbun_ddns"
+name = "porkbun-ddns"
 description = "A tool for updating Porkbun DNS A/AAAA records automatically"
 version = "0.1.0"
+authors = ["Matthew Brown <matthew.e.brown.17@gmail.com>"]
 edition = "2024"
 
 [dependencies]

@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
-use std::fmt::Display;
+use std::fmt::{Debug, Display};
 use std::path::PathBuf;
 
 use clap::Parser;
@@ -22,13 +22,13 @@ use crate::api::model::DNSRecord;
 struct Args {
     /// Path to TOML file containing configuration for the domains to update.
     #[arg(
-        short = 'c',
-        long = "cfg",
+        short,
+        long,
         env = "PORKBUN_DDNS_CONFIG",
         value_name = "FILE",
         default_value = "/etc/ddns.toml"
     )]
-    cfg: PathBuf,
+    config: PathBuf,
 
     /// Skip creating or modifying any DNS records on Porkbun.
     ///

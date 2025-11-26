@@ -68,14 +68,14 @@ impl Logger {
     /// Creates a new logger instance.
     pub fn new() -> Self {
         // Determine which log level to use. Default is INFO, but can be overridden by an environment variable.
-        let filter = crate::get_var("LOG_LEVEL")
+        let filter = crate::get_var("PORKBUN_LOG_LEVEL")
             .ok()
             .and_then(|str| str.parse::<LevelFilter>().ok())
             .unwrap_or(LevelFilter::Info);
 
         // Default for timestamps is enabled, but they an be disabled by setting an environment variable.
         let mut timestamps = true;
-        if crate::get_var("NO_LOG_TIMESTAMPS").is_ok_and(|v| !v.is_empty()) {
+        if crate::get_var("PORKBUN_LOG_NO_TIMESTAMPS").is_ok_and(|v| !v.is_empty()) {
             timestamps = false;
         }
 
@@ -100,7 +100,7 @@ impl Logger {
     /// Fallible version of [`Log::log`] to enable the use of `?` within.
     fn try_log(&self, record: &log::Record) -> io::Result<()> {
         // Only log our own messages; hide implementation details (reqwest also has logging)
-        if !record.target().starts_with(env!("CARGO_PKG_NAME")) {
+        if !record.target().starts_with(env!("CARGO_CRATE_NAME")) {
             return Ok(());
         }
 

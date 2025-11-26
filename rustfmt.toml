@@ -1,0 +1,24 @@
+# Uses unstable options. Run with `cargo +nightly fmt`.
+
+max_width = 120
+blank_lines_upper_bound = 2
+
+fn_call_width = 100
+chain_width = 80
+inline_attribute_width = 40
+overflow_delimited_expr = true
+struct_lit_single_line = true
+struct_lit_width = 32
+single_line_if_else_max_width = 70
+use_field_init_shorthand = true
+match_block_trailing_comma = true
+
+imports_layout = "HorizontalVertical"
+imports_granularity = "Module"
+group_imports = "StdExternalCrate"
+reorder_imports = true
+reorder_modules = true
+
+trailing_comma = "Vertical"
+newline_style = "Unix"
+tab_spaces = 4

@@ -7,9 +7,8 @@ use reqwest::header::{HeaderMap, HeaderValue};
 use serde::de::DeserializeOwned;
 use serde_json::{Map as JsonMap, Value as JsonValue, json};
 
-use super::model::{DNSRecord, DNSRecordList, Ping};
+use super::model::{CreatedRecord, DNSRecord, DNSRecordList, Ping};
 use super::{BASE_URL, BASE_URL_V4, IpAddrExt};
-use crate::api::model::CreatedRecord;
 use crate::config::Target;
 
 /// Main access point to the Porkbun API.
