@@ -8,8 +8,7 @@ use std::process::ExitCode;
 
 use eyre::{WrapErr, eyre};
 
-use self::api::model::DNSRecord;
-use self::api::{IpAddrExt, PorkbunClient};
+use self::api::{DNSRecord, IpAddrExt, PorkbunClient};
 use self::config::{Config, Target};
 use self::logging::Logger;
 
@@ -268,7 +267,7 @@ impl App {
         let dns_type = addr.dns_type();
 
         // Check if any of the existing records for this target's domain actually match the target precisely:
-        let mut matching_records = records.iter().filter(|rec| rec.typ == dns_type && target.record_matches(rec));
+        let mut matching_records = records.iter().filter(|rec| rec.typ == dns_type && target.matches_record(rec));
 
         let existing = matching_records.next();
         let num_left = matching_records.count();

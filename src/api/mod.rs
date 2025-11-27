@@ -1,9 +1,10 @@
 mod client;
-pub mod model;
+mod model;
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 pub use self::client::PorkbunClient;
+pub use self::model::DNSRecord;
 
 const BASE_URL: &'static str = "https://api.porkbun.com/api/json/v3";
 const BASE_URL_V4: &'static str = "https://api-ipv4.porkbun.com/api/json/v3";

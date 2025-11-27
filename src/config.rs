@@ -8,7 +8,7 @@ use eyre::{WrapErr, eyre};
 use serde::{Deserialize, Deserializer, de};
 use tokio::fs;
 
-use crate::api::model::DNSRecord;
+use crate::api::DNSRecord;
 
 
 // [FIXME] Serde does not support literals as default values yet: https://github.com/serde-rs/serde/issues/368
@@ -189,7 +189,7 @@ impl Target {
     }
 
     /// Checks if the given [record][DNSRecord] matches this [target][Target].
-    pub fn record_matches(&self, record: &DNSRecord) -> bool {
+    pub fn matches_record(&self, record: &DNSRecord) -> bool {
         match self.subdomain() {
             // '@' as a subdomain refers to the root of the domain; check the whole thing.
             Some("@") | None => record.name == self.domain,
@@ -202,20 +202,12 @@ impl Target {
             },
         }
     }
-
-    // /// Gets a print-friendly label for this [target][Target] that represents how it was specified in the config file.
-    // ///
-    // /// For example, if a target is specified using `@` to refer to the root domain, this method will return
-    // /// `@.domain.com`, even though what we send Porkbun's API looks like `domain.com`.
-    // pub fn label(&self) -> String {
-    //     match self.subdomain() {
-    //         Some(sub) => format!("{sub}.{}", self.domain()),
-    //         None => self.domain().to_string(),
-    //     }
-    // }
 }
 
-/// Formats the target as a
+/// Formats a [`Target`] as a single domain name that represents how it was specified in the config file.
+///
+/// For example, domains specified with a subdomain of `@` will be printed as `@.example.com`, even though the actual
+/// name that would get sent to Porkbun would just be `example.com`.
 impl Display for Target {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if let Some(sub) = self.subdomain() {
