@@ -119,7 +119,8 @@ impl PorkbunClient {
             .wrap_err("POST request failed")?;
 
         let res_text = res_raw.text().await.wrap_err("Failed to read POST response body")?;
-        log::trace!("Received POST response with body: {}", res_text);
+        let res_size = res_text.len();
+        log::trace!("Received POST response of size {res_size} bytes");
 
         match parse_response(&res_text[..]) {
             Ok(Ok(parsed)) => Ok(parsed),

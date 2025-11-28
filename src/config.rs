@@ -5,6 +5,7 @@ use std::path::PathBuf;
 
 use clap::Parser;
 use eyre::{WrapErr, eyre};
+use serde::de::DeserializeSeed;
 use serde::{Deserialize, Deserializer, de};
 use tokio::fs;
 
@@ -148,13 +149,6 @@ impl Config {
 
         // ...other future settings.
     }
-
-    /// Returns the number of IP address modes that are enabled (0, 1, or 2).
-    ///
-    /// Used mostly as a convenience for formatting.
-    pub const fn num_enabled(&self) -> usize {
-        self.ipv4 as usize + self.ipv6 as usize
-    }
 }
 
 
@@ -224,50 +218,69 @@ impl<'de> Deserialize<'de> for Target {
         D: Deserializer<'de>,
         D::Error: de::Error,
     {
-        // ----------------------------------------------------------------------------------------
-        struct TargetVisitor;
+        deserializer.deserialize_any(TargetVisitor)
+    }
+}
 
-        impl<'de> de::Visitor<'de> for TargetVisitor {
-            type Value = Target;
+struct TargetVisitor;
 
-            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-                formatter.write_str("string or map")
-            }
+impl<'de> de::Visitor<'de> for TargetVisitor {
+    type Value = Target;
 
-            fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
-                Ok(Target::from_domain(v.to_string()))
-            }
+    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+        formatter.write_str("string or map")
+    }
 
-            fn visit_string<E: de::Error>(self, v: String) -> Result<Self::Value, E> {
-                Ok(Target::from_domain(v))
-            }
+    fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+        Ok(Target::from_domain(v.to_string()))
+    }
 
-            fn visit_map<A: de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
-                let mut domain = None;
-                let mut subdomain = None;
-                let mut ttl = None;
+    fn visit_string<E: de::Error>(self, v: String) -> Result<Self::Value, E> {
+        Ok(Target::from_domain(v))
+    }
 
-                while let Some(key) = map.next_key::<String>()? {
-                    match key.as_str() {
-                        "domain" => domain = Some(map.next_value::<String>()?),
-                        "subdomain" => subdomain = Some(map.next_value::<String>()?),
-                        "ttl" => ttl = Some(map.next_value::<u32>()?),
-                        other => return Err(de::Error::unknown_field(other, &["domain", "subdomain", "ttl"])),
-                    }
-                }
+    fn visit_map<A: de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+        let mut domain = None;
+        let mut subdomain = None;
+        let mut ttl = None;
 
-                let domain = domain.ok_or_else(|| de::Error::missing_field("domain"))?;
-                let ttl = ttl.unwrap_or(600);
-
-                if subdomain.as_deref() == Some("") {
-                    subdomain = None;
-                }
-
-                Ok(Target { domain, subdomain, ttl })
+        while let Some(key) = map.next_key::<Box<str>>()? {
+            match &key[..] {
+                "domain" => domain = Some(map.next_value_seed(DomainSegment::DOMAIN)?),
+                "subdomain" => subdomain = Some(map.next_value_seed(DomainSegment::SUBDOMAIN)?),
+                "ttl" => ttl = Some(map.next_value::<u32>()?),
+                other => return Err(de::Error::unknown_field(other, &["domain", "subdomain", "ttl"])),
             }
         }
-        // ----------------------------------------------------------------------------------------
 
-        deserializer.deserialize_any(TargetVisitor)
+        let domain = domain.ok_or_else(|| de::Error::missing_field("domain"))?;
+        let subdomain = subdomain.filter(|str| &str[..] != "");
+        let ttl = ttl.unwrap_or(600);
+
+        Ok(Target { domain, subdomain, ttl })
+    }
+}
+
+/// A [`DeserializeSeed`] impl. that deserializes a string while enforcing that it does not contain whitespace. The
+/// seeded version of `Deserialize` is used simply to allow for a better error message.
+struct DomainSegment(&'static str);
+
+impl DomainSegment {
+    pub const DOMAIN: DomainSegment = DomainSegment("domain names");
+    pub const SUBDOMAIN: DomainSegment = DomainSegment("subdomains");
+}
+
+impl<'de> DeserializeSeed<'de> for DomainSegment {
+    type Value = String;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let str = String::deserialize(deserializer)?;
+        match str.chars().find(|c| c.is_whitespace()) {
+            Some(_) => Err(de::Error::custom(format_args!("{} may not contain whitespace", self.0))),
+            None => Ok(str),
+        }
     }
 }

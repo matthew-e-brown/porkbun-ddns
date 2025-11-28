@@ -2,7 +2,7 @@ mod api;
 mod config;
 mod logging;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::process::ExitCode;
 
@@ -42,7 +42,7 @@ pub async fn main() -> ExitCode {
         Err(err) => {
             log::error!(
                 "Failed to determine current IP {addresses}: {err:#}",
-                addresses = pluralize!("address", "addresses", app.config.num_enabled()),
+                addresses = pluralize!("address", "addresses", app.mode_count()),
             );
             return ExitCode::FAILURE;
         },
@@ -60,15 +60,6 @@ pub async fn main() -> ExitCode {
     }
 }
 
-
-/// The main application instance. Wraps both the program [`Config`] and a [`PorkbunClient`].
-///
-/// Having this be a separate struct alleviates needing to pass so many parameters around.
-struct App {
-    config: Config,
-    client: PorkbunClient,
-}
-
 /// Gets a variable from the environment or from a `.env` file.
 #[inline]
 #[cfg(feature = "dotenv")]
@@ -81,6 +72,25 @@ fn get_var(key: &str) -> Result<String, dotenvy::Error> {
 #[cfg(not(feature = "dotenv"))]
 fn get_var(key: &str) -> Result<String, std::env::VarError> {
     std::env::var(key)
+}
+
+/// The main application instance.
+///
+/// Having this be a separate struct alleviates needing to pass so many parameters around.
+struct App {
+    client: PorkbunClient,
+    ipv4_enabled: bool,
+    ipv6_enabled: bool,
+    ipv6_error: bool,
+    dry_run: bool,
+    targets: Vec<Target>,
+}
+
+impl App {
+    /// Returns the number of IP address modes (IPv4, IPv6) that are enabled (0, 1, or 2).
+    pub const fn mode_count(&self) -> usize {
+        self.ipv4_enabled as usize + self.ipv6_enabled as usize
+    }
 }
 
 impl App {
@@ -96,12 +106,19 @@ impl App {
         let client = PorkbunClient::new(api_key, secret_key);
 
         log::debug!("Initialization successful.");
-        Ok(Self { config, client })
+        Ok(App {
+            client,
+            ipv4_enabled: config.ipv4,
+            ipv6_enabled: config.ipv6,
+            ipv6_error: config.ipv6_error,
+            dry_run: config.dry_run,
+            targets: config.targets,
+        })
     }
 
     /// Fetches IPv4 and IPv6 addresses for the current system.
     pub async fn get_addresses(&self) -> eyre::Result<(Option<Ipv4Addr>, Option<Ipv6Addr>)> {
-        let num_enabled = self.config.num_enabled();
+        let num_enabled = self.mode_count();
         log::debug!(
             "Pinging Porkbun API for current IP {addresses}...",
             addresses = pluralize!("address", "addresses", num_enabled),
@@ -117,14 +134,14 @@ impl App {
         // Ping the base `/ping` endpoint first: it returns either IPv6 or IPv4.
         match self.client.ping().await? {
             IpAddr::V4(addr) => {
-                if self.config.ipv4 {
+                if self.ipv4_enabled {
                     log::info!("Found current IPv4 address: {addr}");
                     ipv4 = Some(addr);
                 }
 
-                if self.config.ipv6 {
+                if self.ipv6_enabled {
                     // If IPv6 is set to hard-error mode, or if IPv6 is the only one enabled, this is an error.
-                    if self.config.ipv6_error || !self.config.ipv4 {
+                    if self.ipv6_error || !self.ipv4_enabled {
                         return Err(eyre!("Tried to get IPv6 address from Porkbun API, but only got IPv4"));
                     }
 
@@ -133,12 +150,12 @@ impl App {
                 }
             },
             IpAddr::V6(addr) => {
-                if self.config.ipv6 {
+                if self.ipv6_enabled {
                     log::info!("Found current IPv6 address: {addr}");
                     ipv6 = Some(addr);
                 }
 
-                if self.config.ipv4 {
+                if self.ipv4_enabled {
                     log::debug!("Pinging again for IPv4 address...");
                     let addr = self.client.ping_v4().await?;
                     log::info!("Found current IPv4 address: {addr}");
@@ -156,52 +173,37 @@ impl App {
     /// Instead, this method handles logging/reporting all errors that occur over the course of the entire operation.
     /// Then, the total number of errors is returned.
     pub async fn run(&self, ipv4: Option<Ipv4Addr>, ipv6: Option<Ipv6Addr>) -> usize {
-        if self.config.dry_run {
+        if self.dry_run {
             log::warn!("dry_run is enabled: no create/edit requests will be sent through to Porkbun.");
         }
-
-        // Used for printing more accurate log messages.
-        let search_type = match (ipv4, ipv6) {
-            (Some(_), None) => "A",
-            (None, Some(_)) => "AAAA",
-            (Some(_), Some(_)) => "A/AAAA",
-            // Shouldn't be possible to get this far with neither address; rest of application should have handled it.
-            // Either way, this method has nothing to do, so we can just return as normal.
-            (None, None) => return 0,
-        };
 
         // Step 1: Fetch existing records for all domains
         // =============================================================================================================
 
         // First build a unique list of root domain names. Then we can send each one on its own task to get records.
-        let mut current_records = HashMap::<&str, Box<[DNSRecord]>>::new();
+        let mut current_records = HashMap::<&str, Vec<DNSRecord>>::new();
 
-        for target in &self.config.targets {
-            // Start each one off with an empty (read: non-allocating) boxed-slice that can get replaced through a
-            // `&mut` reference in each task.
+        for target in &self.targets {
+            // Start each one off with an empty (read: non-allocating) vec that can get extended by each task.
             let domain = target.domain();
-            current_records.entry(domain).or_insert_with(|| [].into());
+            current_records.entry(domain).or_insert_with(Vec::new);
         }
 
         log::debug!(
-            "Checking Porkbun for existing DNS records on {} unique {domains}...",
-            current_records.len(),
-            domains = pluralize!("domain", "domains", current_records.len()),
+            "Querying Porkbun API for {n} {domains} existing DNS records...",
+            n = current_records.len(),
+            domains = pluralize!("domain's", "domains'", current_records.len()),
         );
 
         let record_tasks = current_records.iter_mut().map(async |(domain, records)| -> Result<(), ()> {
             match self.client.get_existing_records(domain).await {
-                Ok(mut existing) => {
-                    // We only ever need A/AAAA records, get rid of everything else.
-                    existing.retain(|r| (ipv4.is_some() && r.typ == "A") || (ipv6.is_some() && r.typ == "AAAA"));
+                Ok(existing) => {
+                    *records = existing;
 
-                    let count = existing.len();
-                    *records = existing.into_boxed_slice();
+                    if log::log_enabled!(log::Level::Debug) {
+                        log_records(log::Level::Debug, domain, records);
+                    }
 
-                    log::debug!(
-                        "Found {count} {search_type} {records} for {domain}.",
-                        records = pluralize!("record", "records", count)
-                    );
                     Ok(())
                 },
                 Err(err) => {
@@ -221,7 +223,6 @@ impl App {
         // =============================================================================================================
 
         let target_tasks = self
-            .config
             .targets
             .iter()
             .filter_map(|target| {
@@ -267,15 +268,31 @@ impl App {
         let dns_type = addr.dns_type();
 
         // Check if any of the existing records for this target's domain actually match the target precisely:
-        let mut matching_records = records.iter().filter(|rec| rec.typ == dns_type && target.matches_record(rec));
+        let mut existing = None;
+        for record in records {
+            if !target.matches_record(record) {
+                continue;
+            }
 
-        let existing = matching_records.next();
-        let num_left = matching_records.count();
-
-        // There's probably some elegant way to handle multiple records existing for the same target. For now...
-        // we'll let the user handle this.
-        if num_left > 0 {
-            return Err(eyre!("Multiple existing {dns_type} records matched target, unsure which to update"));
+            if record.typ == dns_type {
+                if existing.is_none() {
+                    existing = Some(record);
+                } else {
+                    // We don't really have a way to handle when there are multiple existing records. Do we replace both
+                    // of them? How can we know if that's a good idea if we don't know why there are two? We'll just let
+                    // the user deal with it (for now, at least).
+                    return Err(eyre!(
+                        "Found more than one existing {dns_type} records for {target}, unsure which to update"
+                    ));
+                }
+            } else if record.typ == "CNAME" || record.typ == "ALIAS" {
+                // It's not possible to create an A or AAAA record when there is an ALIAS or a CNAME record, since those
+                // work by passing records through to another host. Porkbun's API ideally should handle this and return
+                // an error in their API response, but the message they return doesn't actually give a reason (it does
+                // in their web interface, though). So, we'll keep an eye out for it.
+                return Err(eyre!("A CNAME or ALIAS record already exists for host {target}")
+                    .wrap_err(format!("Can't create {dns_type} record")));
+            }
         }
 
         if let Some(record) = existing {
@@ -291,7 +308,7 @@ impl App {
                 log::info!("{target}: Nothing to do. Found existing {dns_type} record #{id} with content {addr}.");
                 Ok(())
             } else {
-                if !self.config.dry_run {
+                if !self.dry_run {
                     self.client
                         .edit_record(target, id, addr)
                         .await
@@ -303,7 +320,7 @@ impl App {
             }
         } else {
             let id;
-            if !self.config.dry_run {
+            if !self.dry_run {
                 id = self
                     .client
                     .create_record(target, addr)
@@ -316,5 +333,39 @@ impl App {
             log::info!("{target}: Created new {dns_type} record #{id} with content {addr}.");
             Ok(())
         }
+    }
+}
+
+/// Helper function for logging which records were retrieved for a given domain.
+fn log_records(level: log::Level, domain: &str, records: &[DNSRecord]) {
+    if records.len() == 0 {
+        log::log!(level, "Found 0 existing records for {domain}.");
+    } else {
+        // Count how many records of each specific type we found:
+        let mut counts = BTreeMap::new();
+        for rec in &*records {
+            *(counts.entry(&rec.typ[..]).or_insert(0usize)) += 1;
+        }
+
+        // Don't feel like bringing all of itertools in just to get `.join`...
+        let mut counts = counts.into_iter();
+        let counts_str = counts
+            .next()
+            .map(move |(typ, n)| {
+                counts.fold(format!("{n} {typ}"), |mut acc, (typ, n)| {
+                    let bits = [", ", &n.to_string(), " ", typ];
+                    acc.reserve(bits.into_iter().map(str::len).sum());
+                    acc.extend(bits);
+                    acc
+                })
+            })
+            .unwrap(); // We already know there is at least one record
+
+        log::log!(
+            level,
+            "Found {count} total {records} for {domain} ({counts_str}).",
+            count = records.len(),
+            records = pluralize!("record", "records", records.len())
+        );
     }
 }
