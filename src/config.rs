@@ -115,7 +115,9 @@ impl Config {
 
         config.extend_from_args(&args);
 
-        log::trace!("Final config: {config:?}");
+        // Again, this will run in a cron job / timer. This is a lot of unnecessary stuff to dump into logs.
+        // It may be helpful to have again later, though...
+        /* log::trace!("Final config: {config:?}"); */
 
         // Check that all targets are unique:
         let mut tgt_labels = HashMap::with_capacity(config.targets.len());

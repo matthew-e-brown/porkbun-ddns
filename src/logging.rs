@@ -94,22 +94,19 @@ impl Logger {
 
     /// Fallible version of [`Log::log`] to enable the use of `?` within.
     fn try_log(&self, record: &log::Record) -> io::Result<()> {
-        // Only log our own messages; hide implementation details (reqwest also has logging)
+        // Only log our own messages; hide implementation details (e.g., reqwest also has logging, hide those)
         if !record.target().starts_with(env!("CARGO_CRATE_NAME")) {
             return Ok(());
         }
 
-        if !self.enabled(record.metadata()) {
-            return Ok(());
-        }
-
         // If we have a journald connection, forward the message directly there instead of printing it ourselves.
-        // [TODO] Decide if I want to do my own level filtering first, or if I just want to forward everything on to
-        //        journald and then do filtering there. Filtering myself first will help keep logs small for a service
-        //        that runs so often (every 15-30 minutes).
         #[cfg(all(unix, feature = "journald"))]
         if let Some(journald) = self.journald.as_ref() {
             return journald.journal_send(record); // Also returns io::Result
+        }
+
+        if !self.enabled(record.metadata()) {
+            return Ok(());
         }
 
         // `anstream`'s versions of `stderr` will automatically handle terminal/VT configuration and NO_COLOR support.

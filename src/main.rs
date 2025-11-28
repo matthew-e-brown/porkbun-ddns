@@ -30,6 +30,8 @@ pub async fn main() -> ExitCode {
         },
     };
 
+    log::info!("Starting...");
+
     let (ipv4, ipv6) = match app.get_addresses().await {
         // `get_addresses` will return two `None`s only if both are disabled. Otherwise, at least one is enabled,
         // meaning the only other option is for an error to have occurred or for at least one of them to be valid.
@@ -106,7 +108,7 @@ impl App {
         let secret_key = get_var("PORKBUN_SECRET_KEY").wrap_err("Failed to get PORKBUN_SECRET_KEY from environment")?;
         let client = PorkbunClient::new(api_key, secret_key);
 
-        log::debug!("Initialization successful.");
+        log::trace!("Initialization successful.");
         Ok(App {
             client,
             ipv4_enabled: config.ipv4,
@@ -136,7 +138,7 @@ impl App {
         match self.client.ping().await? {
             IpAddr::V4(addr) => {
                 if self.ipv4_enabled {
-                    log::info!("Found current IPv4 address: {addr}");
+                    log::debug!("Found current IPv4 address: {addr}");
                     ipv4 = Some(addr);
                 }
 
@@ -147,19 +149,19 @@ impl App {
                     }
 
                     // If the non-IPv4 endpoint gave us IPv4, then we can't get an IPv6. We don't even need to try.
-                    log::info!("Found current IPv6 address: none.");
+                    log::debug!("Found current IPv6 address: none.");
                 }
             },
             IpAddr::V6(addr) => {
                 if self.ipv6_enabled {
-                    log::info!("Found current IPv6 address: {addr}");
+                    log::debug!("Found current IPv6 address: {addr}");
                     ipv6 = Some(addr);
                 }
 
                 if self.ipv4_enabled {
                     log::debug!("Pinging again for IPv4 address...");
                     let addr = self.client.ping_v4().await?;
-                    log::info!("Found current IPv4 address: {addr}");
+                    log::debug!("Found current IPv4 address: {addr}");
                     ipv4 = Some(addr);
                 }
             },
@@ -223,40 +225,34 @@ impl App {
         // Step 2: Actually process all of the targets
         // =============================================================================================================
 
-        let target_tasks = self
-            .targets
-            .iter()
-            .filter_map(|target| {
-                let Some(records) = current_records.get(target.domain()) else {
-                    // Target's records might be missing if we previously failed to fetch them. Error would've already
-                    // been logged in that case, so we don't need to report another one.
+        let target_tasks = self.targets.iter().filter_map(|target| {
+            match current_records.get(target.domain()) {
+                Some(records) if records.len() > 0 => {
+                    // Convert an iterator of `Option<IpAddr>` into an iterator of `Option<impl Future>`, which gets
+                    // filtered down into an iterator of `impl Future`.
+                    let addrs = [ipv4.map(IpAddr::V4), ipv6.map(IpAddr::V6)];
+                    let tasks = addrs.into_iter().filter_map(move |addr| {
+                        addr.map(async move |addr| -> Result<(), ()> {
+                            let res = self.handle_target(target, records, addr).await;
+                            res.map_err(|err| log::error!("{target}: {err:#}")) // log error while mapping to ()
+                        })
+                    });
+
+                    // Return an `Iterator<impl Future>` to the outer `filter_map`, giving `Iter<Iter<impl
+                    // Future>>`, which then gets flattened down into one final iterator of futures.
+                    Some(tasks)
+                },
+                _ => {
+                    // Target's records might be missing if we previously failed to fetch them. Error would've
+                    // already been logged in that case, so we don't need to report another one.
                     log::warn!("{target}: Skipped due to missing DNS records.");
                     // Skip over this target in the outer `filter_map`.
                     return None;
-                };
+                },
+            }
+        });
 
-                // Convert an iterator of `Option<IpAddr>` into an iterator of `Option<impl Future>`, which gets
-                // filtered down into an iterator of `impl Future`.
-                let addrs = [ipv4.map(IpAddr::V4), ipv6.map(IpAddr::V6)];
-                let tasks = addrs.into_iter().filter_map(move |addr| {
-                    addr.map(async move |addr| -> Result<(), ()> {
-                        match self.handle_target(target, records, addr).await {
-                            Ok(()) => Ok(()),
-                            Err(err) => {
-                                log::error!("{target}: {err:#}");
-                                Err(())
-                            },
-                        }
-                    })
-                });
-
-                // Return an `Iterator<impl Future>` to the outer `filter_map`, giving `Iter<Iter<impl Future>>`, which
-                // then gets flattened down into one final iterator of futures.
-                Some(tasks)
-            })
-            .flatten();
-
-        err_count += futures::future::join_all(target_tasks)
+        err_count += futures::future::join_all(target_tasks.flatten())
             .await
             .into_iter()
             .filter(Result::is_err)
@@ -302,11 +298,12 @@ impl App {
             // Check what the IP address is on the existing record
             let existing_addr = record
                 .try_parse_ip()
-                .wrap_err_with(|| format!("Found matching {dns_type} record #{id}, but it was malformed"))?;
+                .wrap_err_with(|| format!("Found matching {dns_type} record, but it was malformed"))?;
 
             // If the address on the record matches our current address, we don't need to update anything.
             if existing_addr == addr {
-                log::info!("{target}: Nothing to do. Found existing {dns_type} record #{id} with content {addr}.");
+                log::debug!("{target}: Found existing {dns_type} record with content {addr}. Nothing to do.");
+                log::trace!("{target}: Existing {} record has ID {}", record.typ, record.id);
                 Ok(())
             } else {
                 if !self.dry_run {
@@ -316,7 +313,8 @@ impl App {
                         .wrap_err("Failed to edit DNS record")?;
                 }
 
-                log::info!("{target}: Edited existing {dns_type} record #{id} from {existing_addr} to {addr}.");
+                log::info!("{target}: Edited existing {dns_type} record from {existing_addr} to {addr}.");
+                log::trace!("{target}: Edited {} record has ID {}", record.typ, record.id);
                 Ok(())
             }
         } else {
@@ -331,7 +329,8 @@ impl App {
                 id = "<ID>".to_string();
             }
 
-            log::info!("{target}: Created new {dns_type} record #{id} with content {addr}.");
+            log::info!("{target}: Created new {dns_type} record with content {addr}.");
+            log::trace!("{target}: New record has ID {id}");
             Ok(())
         }
     }
