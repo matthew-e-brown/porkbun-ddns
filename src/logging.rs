@@ -16,6 +16,7 @@ pub struct Logger {
     journald: Option<JournalLog>,
 }
 
+/// Timestamp format for log output. Format is `Jul 8 2001 14:46:23`.
 static TIMESTAMP_FMT: LazyLock<&'static [chrono::format::Item<'static>]> = LazyLock::new(|| {
     // NB: `LazyLock`'s own docs have a note about how static items don't ever get dropped, so leaking this Vec into a
     // static slice doesn't make any difference in that regard.
@@ -66,13 +67,7 @@ mod styles {
 
 impl Logger {
     /// Creates a new logger instance.
-    pub fn new() -> Self {
-        // Determine which log level to use. Default is INFO, but can be overridden by an environment variable.
-        let filter = crate::get_var("PORKBUN_LOG_LEVEL")
-            .ok()
-            .and_then(|str| str.parse::<LevelFilter>().ok())
-            .unwrap_or(LevelFilter::Info);
-
+    pub fn new(level: LevelFilter) -> Self {
         // Default for timestamps is enabled, but they an be disabled by setting an environment variable.
         let mut timestamps = true;
         if crate::get_var("PORKBUN_LOG_NO_TIMESTAMPS").is_ok_and(|v| !v.is_empty()) {
@@ -84,7 +79,7 @@ impl Logger {
         let journald = init_journald().inspect(|_| timestamps = false);
 
         Self {
-            filter,
+            filter: level,
             timestamps,
             #[cfg(all(unix, feature = "journald"))]
             journald,

@@ -6,10 +6,11 @@ use std::collections::{BTreeMap, HashMap};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::process::ExitCode;
 
+use clap::Parser;
 use eyre::{WrapErr, eyre};
 
 use self::api::{DNSRecord, IpAddrExt, PorkbunClient};
-use self::config::{Config, Target};
+use self::config::{Args, Config, Target};
 use self::logging::Logger;
 
 /// Formatting helper for log and error messages
@@ -21,8 +22,6 @@ macro_rules! pluralize {
 
 #[tokio::main]
 pub async fn main() -> ExitCode {
-    Logger::new().init().expect("no other logger should have been set yet");
-
     let app = match App::init().await {
         Ok(app) => app,
         Err(err) => {
@@ -96,9 +95,11 @@ impl App {
 impl App {
     /// Initializes the application instance.
     pub async fn init() -> eyre::Result<Self> {
-        log::debug!("Initializing...");
-
-        let config = Config::load().await?;
+        let args = Args::parse();
+        Logger::new(args.log_level)
+            .init()
+            .expect("no other logger should have been set yet");
+        let config = Config::from_args(args).await?;
 
         log::trace!("Loading API keys from environment");
         let api_key = get_var("PORKBUN_API_KEY").wrap_err("Failed to get PORKBUN_API_KEY from environment")?;
@@ -327,7 +328,7 @@ impl App {
                     .await
                     .wrap_err("Failed to create DNS record")?;
             } else {
-                id = "<record_id>".to_string();
+                id = "<ID>".to_string();
             }
 
             log::info!("{target}: Created new {dns_type} record #{id} with content {addr}.");

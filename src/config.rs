@@ -3,7 +3,6 @@ use std::collections::hash_map::Entry;
 use std::fmt::{Debug, Display};
 use std::path::PathBuf;
 
-use clap::Parser;
 use eyre::{WrapErr, eyre};
 use serde::de::DeserializeSeed;
 use serde::{Deserialize, Deserializer, de};
@@ -20,7 +19,7 @@ use crate::api::DNSRecord;
 // `Config`, which is loaded from a TOML file.
 #[derive(Debug, clap::Parser)]
 #[command(version, about, max_term_width = 100)]
-struct Args {
+pub struct Args {
     /// Path to TOML file containing configuration for the domains to update.
     #[arg(
         short,
@@ -29,42 +28,53 @@ struct Args {
         value_name = "FILE",
         default_value = "/etc/ddns.toml"
     )]
-    config: PathBuf,
+    pub config: PathBuf,
 
     /// Skip creating or modifying any DNS records on Porkbun.
     ///
     /// When this option is enabled, current IP addresses will be fetched and the records that need to be updated will
     /// be printed, but no changes will actually be made.
     #[arg(short = 'n', long)]
-    dry_run: bool,
+    pub dry_run: bool,
+
+    /// Controls the verbosity of logs.
+    ///
+    /// Possible log levels are 'error', 'warn', 'info', 'debug', and 'trace' (in that order).
+    #[arg(
+        long,
+        env = "PORKBUN_LOG_LEVEL",
+        value_name = "LEVEL",
+        default_value = "info",
+    )]
+    pub log_level: log::LevelFilter,
 
     /// Update IPv4 (A) records for all domains.
     ///
     /// This command-line option force-enables IPv4 updates, regardless of what the 'ipv4' setting in the config file
     /// says.
     #[arg(long, conflicts_with = "no_ipv4")]
-    ipv4: bool,
+    pub ipv4: bool,
 
     /// Update IPv6 (AAAA) records for all domains.
     ///
     /// This command-line option force-enables IPv6 updates, regardless of what the 'ipv6' setting in the config file
     /// says.
     #[arg(long, conflicts_with = "no_ipv6")]
-    ipv6: bool,
+    pub ipv6: bool,
 
     /// Disable the updating of IPv4 (A) records for all domains.
     ///
     /// This command-line option force-disables IPv4 updates, regardless of what the 'ipv4' setting in the config file
     /// says.
     #[arg(long)]
-    no_ipv4: bool,
+    pub no_ipv4: bool,
 
     /// Disable the updating of IPv6 (AAAA) records for all domains.
     ///
     /// This command-line option force-disables IPv6 updates, regardless of what the 'ipv6' setting in the config file
     /// says.
     #[arg(long)]
-    no_ipv6: bool,
+    pub no_ipv6: bool,
 }
 
 /// Main program configuration and job specification.
@@ -95,10 +105,7 @@ pub struct Config {
 
 impl Config {
     /// Loads runtime configuration from command line arguments and configuration file.
-    pub async fn load() -> eyre::Result<Self> {
-        log::trace!("Parsing command line arguments");
-        let args = Args::parse();
-
+    pub async fn from_args(args: Args) -> eyre::Result<Self> {
         if log::log_enabled!(log::Level::Trace) {
             log::trace!("Reading configuration from {}", &args.config.to_string_lossy());
         }
