@@ -40,12 +40,7 @@ pub struct Args {
     /// Controls the verbosity of logs.
     ///
     /// Possible log levels are 'error', 'warn', 'info', 'debug', and 'trace' (in that order).
-    #[arg(
-        long,
-        env = "PORKBUN_LOG_LEVEL",
-        value_name = "LEVEL",
-        default_value = "info",
-    )]
+    #[arg(long, env = "PORKBUN_LOG_LEVEL", value_name = "LEVEL", default_value = "info")]
     pub log_level: log::LevelFilter,
 
     /// Update IPv4 (A) records for all domains.
