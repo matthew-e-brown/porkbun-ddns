@@ -10,30 +10,18 @@ use tokio::fs;
 
 use crate::api::DNSRecord;
 
-
-// [FIXME] Serde does not support literals as default values yet: https://github.com/serde-rs/serde/issues/368
-#[rustfmt::skip] const fn bool<const X: bool>() -> bool { X }
-#[rustfmt::skip] const fn empty<T>() -> Vec<T> { Vec::new() }
-
-// Internal struct for command-line flags: **not** the main program configuration. The main configuration comes from
-// `Config`, which is loaded from a TOML file.
 #[derive(Debug, clap::Parser)]
 #[command(version, about, max_term_width = 100)]
 pub struct Args {
     /// Path to TOML file containing configuration for the domains to update.
-    #[arg(
-        short,
-        long,
-        env = "PORKBUN_DDNS_CONFIG",
-        value_name = "FILE",
-        default_value = "/etc/ddns.toml"
-    )]
+    #[arg(short, long, env = "PORKBUN_DDNS_CONFIG", value_name = "FILE")]
+    #[cfg_attr(unix, arg(default_value = "/etc/porkbun-ddns/ddns.toml"))]
     pub config: PathBuf,
 
     /// Skip creating or modifying any DNS records on Porkbun.
     ///
-    /// When this option is enabled, current IP addresses will be fetched and the records that need to be updated will
-    /// be printed, but no changes will actually be made.
+    /// When this option is enabled, current IP addresses will be fetched and existing records will be checked, but no
+    /// changes will actually be made.
     #[arg(short = 'n', long)]
     pub dry_run: bool,
 
@@ -45,58 +33,62 @@ pub struct Args {
 
     /// Update IPv4 (A) records for all domains.
     ///
-    /// This command-line option force-enables IPv4 updates, regardless of what the 'ipv4' setting in the config file
-    /// says.
-    #[arg(long, conflicts_with = "no_ipv4")]
+    /// This flag forces the IPv4 mode to "enabled", regardless of what the 'ipv4' setting in the config file says.
+    #[arg(long, conflicts_with_all = ["try_ipv4", "no_ipv4"])]
     pub ipv4: bool,
 
-    /// Update IPv6 (AAAA) records for all domains.
+    /// Update IPv4 (A) records for all domains; do nothing if an IPv4 address cannot be determined.
     ///
-    /// This command-line option force-enables IPv6 updates, regardless of what the 'ipv6' setting in the config file
-    /// says.
-    #[arg(long, conflicts_with = "no_ipv6")]
-    pub ipv6: bool,
+    /// This flags forces the IPv4 mode to "try", regardless of what the 'ipv4' setting in the config file says.
+    #[arg(long, conflicts_with_all = ["ipv4", "no_ipv4"])]
+    pub try_ipv4: bool,
 
     /// Disable the updating of IPv4 (A) records for all domains.
     ///
-    /// This command-line option force-disables IPv4 updates, regardless of what the 'ipv4' setting in the config file
-    /// says.
-    #[arg(long)]
+    /// This flag forces the IPv4 mode to "disabled", regardless of what the 'ipv4' setting in the config file says.
+    #[arg(long, conflicts_with_all = ["ipv4", "try_ipv4"])]
     pub no_ipv4: bool,
+
+    /// Update IPv6 (AAAA) records for all domains.
+    ///
+    /// This flag forces the IPv6 mode to "enabled", regardless of what the 'ipv6' setting in the config file says.
+    #[arg(long, conflicts_with_all = ["try_ipv6", "no_ipv6"])]
+    pub ipv6: bool,
+
+    /// Update IPv6 (AAAA) records for all domains; do nothing if an IPv6 address cannot be determined.
+    ///
+    /// This flags forces the IPv6 mode to "try", regardless of what the 'ipv6' setting in the config file says.
+    #[arg(long, conflicts_with_all = ["ipv6", "no_ipv6"])]
+    pub try_ipv6: bool,
 
     /// Disable the updating of IPv6 (AAAA) records for all domains.
     ///
-    /// This command-line option force-disables IPv6 updates, regardless of what the 'ipv6' setting in the config file
-    /// says.
-    #[arg(long)]
+    /// This flag forces the IPv6 mode to "disabled", regardless of what the 'ipv6' setting in the config file says.
+    #[arg(long, conflicts_with_all = ["ipv6", "try_ipv6"])]
     pub no_ipv6: bool,
 }
 
 /// Main program configuration and job specification.
 #[derive(Debug, Deserialize)]
 pub struct Config {
-    /// Fetch addresses and determine which records to update, but don't actually update.
-    #[serde(default = "bool::<false>", skip)] // Not set by serde; passed through from CLI args
-    pub dry_run: bool,
-
     /// Enables updating of `A` records with an IPv4 address.
-    #[serde(default = "bool::<true>")]
-    pub ipv4: bool,
+    #[serde(default = "enabled")]
+    pub ipv4: AddrMode,
 
     /// Enables updating of `AAAA` records with an IPv6 address.
-    #[serde(default = "bool::<false>")]
-    pub ipv6: bool,
-
-    /// When this option is false (the default), `AAAA` records are updated "if possible:" failure to acquire an IPv6
-    /// address when pinging Porkbun will not cause an error. When this option is true (and IPv6 is enabled), failure to
-    /// acquire an IPv6 address will trigger a fatal error.
-    #[serde(default = "bool::<false>")]
-    pub ipv6_error: bool,
+    #[serde(default = "disabled")]
+    pub ipv6: AddrMode,
 
     /// A list of jobs describing domains/subdomains to update.
+    // Better to let the program print "nothing enabled" than to throw an error, I think.
     #[serde(default = "empty")]
     pub targets: Vec<Target>,
 }
+
+// [FIXME] Serde does not support literals as default values yet: https://github.com/serde-rs/serde/issues/368
+#[rustfmt::skip] const fn empty<T>() -> Vec<T> { Vec::new() }
+#[rustfmt::skip] const fn enabled() -> AddrMode { AddrMode::Enabled }
+#[rustfmt::skip] const fn disabled() -> AddrMode { AddrMode::Disabled }
 
 impl Config {
     /// Loads runtime configuration from command line arguments and configuration file.
@@ -116,17 +108,17 @@ impl Config {
 
         // Check that all targets are unique:
         let mut tgt_labels = HashMap::with_capacity(config.targets.len());
-        let mut i = 0;
+        let mut idx = 0usize;
         for tgt in &config.targets {
-            i += 1;
+            idx += 1;
             match tgt_labels.entry(tgt.to_string()) {
                 Entry::Vacant(entry) => {
-                    entry.insert(i);
+                    entry.insert(idx);
                 },
                 Entry::Occupied(entry) => {
-                    let j = *entry.get();
-                    let k = entry.key();
-                    return Err(eyre!("Target {k} specified more than once (targets {j} and {i})")
+                    let idx1 = *entry.get();
+                    let key = entry.key();
+                    return Err(eyre!("Target {key} specified more than once (targets {idx1} and {idx})")
                         .wrap_err("Invalid configuration"));
                 },
             }
@@ -137,24 +129,27 @@ impl Config {
 
     /// Copies over non-TOML settings from the command line into this [`Config`] struct.
     fn extend_from_args(&mut self, args: &Args) {
-        self.dry_run = args.dry_run;
-
+        // Only copy the values from args if they were actually specified in args,
+        // otherwise let the config values through (both for true and for false).
         if args.ipv4 {
-            self.ipv4 = true;
+            self.ipv4 = AddrMode::Enabled;
         } else if args.no_ipv4 {
-            self.ipv4 = false;
+            self.ipv4 = AddrMode::Disabled;
+        } else if args.try_ipv4 {
+            self.ipv4 = AddrMode::Try;
         }
 
         if args.ipv6 {
-            self.ipv6 = true;
+            self.ipv6 = AddrMode::Enabled;
         } else if args.no_ipv6 {
-            self.ipv6 = false;
+            self.ipv6 = AddrMode::Disabled;
+        } else if args.try_ipv6 {
+            self.ipv6 = AddrMode::Try;
         }
 
         // ...other future settings.
     }
 }
-
 
 /// Specification for a single domain or subdomain to update.
 #[derive(Debug, Clone)]
@@ -162,6 +157,14 @@ pub struct Target {
     domain: String,
     subdomain: Option<String>,
     ttl: u32,
+}
+
+/// A value which can be true, false, or something in between.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddrMode {
+    Enabled,
+    Disabled,
+    Try,
 }
 
 impl Target {
@@ -202,6 +205,33 @@ impl Target {
     }
 }
 
+impl AddrMode {
+    /// Checks whether or not this address mode is set to `Enabled` or `Try`.
+    pub const fn is_enabled(&self) -> bool {
+        match self {
+            AddrMode::Enabled | AddrMode::Try => true,
+            AddrMode::Disabled => false,
+        }
+    }
+
+    /// Checks whether or not this address mode is required or allowed to fail.
+    pub const fn is_required(&self) -> bool {
+        match self {
+            AddrMode::Enabled => true,
+            _ => false,
+        }
+    }
+}
+
+impl From<bool> for AddrMode {
+    fn from(value: bool) -> Self {
+        match value {
+            true => AddrMode::Enabled,
+            false => AddrMode::Disabled,
+        }
+    }
+}
+
 /// Formats a [`Target`] as a single domain name that represents how it was specified in the config file.
 ///
 /// For example, domains specified with a subdomain of `@` will be printed as `@.example.com`, even though the actual
@@ -223,6 +253,16 @@ impl<'de> Deserialize<'de> for Target {
         D::Error: de::Error,
     {
         deserializer.deserialize_any(TargetVisitor)
+    }
+}
+
+impl<'de> Deserialize<'de> for AddrMode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+        D::Error: de::Error,
+    {
+        deserializer.deserialize_any(AddrModeVisitor)
     }
 }
 
@@ -286,5 +326,35 @@ impl<'de> DeserializeSeed<'de> for DomainSegment {
             Some(_) => Err(de::Error::custom(format_args!("{} may not contain whitespace", self.0))),
             None => Ok(str),
         }
+    }
+}
+
+struct AddrModeVisitor;
+
+impl<'de> de::Visitor<'de> for AddrModeVisitor {
+    type Value = AddrMode;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+        formatter.write_str("true, false, \"enabled\", \"disabled\", \"on\", \"off\", or \"try\"")
+    }
+
+    fn visit_bool<E: de::Error>(self, v: bool) -> Result<Self::Value, E> {
+        Ok(v.into())
+    }
+
+    fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+        match v {
+            "enabled" | "on" => Ok(AddrMode::Enabled),
+            "disabled" | "off" => Ok(AddrMode::Disabled),
+            "try" => Ok(AddrMode::Try),
+            other => Err(de::Error::invalid_value(
+                de::Unexpected::Str(other),
+                &"true, false, \"enabled\", \"disabled\", or \"try\"",
+            )),
+        }
+    }
+
+    fn visit_string<E: de::Error>(self, v: String) -> Result<Self::Value, E> {
+        self.visit_str(&v[..])
     }
 }

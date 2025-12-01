@@ -49,6 +49,11 @@ pub async fn main() -> ExitCode {
         },
     };
 
+    if app.targets.len() == 0 {
+        log::info!("Zero targets specified. Nothing to do.");
+        return ExitCode::SUCCESS;
+    }
+
     match app.run(ipv4, ipv6).await {
         0 => {
             log::info!("Done.");
@@ -80,10 +85,11 @@ fn get_var(key: &str) -> Result<String, std::env::VarError> {
 /// Having this be a separate struct alleviates needing to pass so many parameters around.
 struct App {
     client: PorkbunClient,
+    dry_run: bool,
     ipv4_enabled: bool,
     ipv6_enabled: bool,
-    ipv6_error: bool,
-    dry_run: bool,
+    ipv4_required: bool,
+    ipv6_required: bool,
     targets: Vec<Target>,
 }
 
@@ -98,6 +104,7 @@ impl App {
     /// Initializes the application instance.
     pub async fn init() -> eyre::Result<Self> {
         let args = Args::parse();
+        let dry_run = args.dry_run;
         Logger::new(args.log_level)
             .init()
             .expect("no other logger should have been set yet");
@@ -111,10 +118,11 @@ impl App {
         log::trace!("Initialization successful.");
         Ok(App {
             client,
-            ipv4_enabled: config.ipv4,
-            ipv6_enabled: config.ipv6,
-            ipv6_error: config.ipv6_error,
-            dry_run: config.dry_run,
+            dry_run,
+            ipv4_enabled: config.ipv4.is_enabled(),
+            ipv6_enabled: config.ipv6.is_enabled(),
+            ipv4_required: config.ipv4.is_required(),
+            ipv6_required: config.ipv6.is_required(),
             targets: config.targets,
         })
     }
@@ -142,13 +150,15 @@ impl App {
                     ipv4 = Some(addr);
                 }
 
+                // The base `/ping` endpoint *always* returns IPv6 when possible (AFAIK). If it gives us IPv4,
+                // there's no way for us to get an IPv6. We don't even need to try.
                 if self.ipv6_enabled {
                     // If IPv6 is set to hard-error mode, or if IPv6 is the only one enabled, this is an error.
-                    if self.ipv6_error || !self.ipv4_enabled {
+                    if self.ipv6_required || !self.ipv4_enabled {
                         return Err(eyre!("Tried to get IPv6 address from Porkbun API, but only got IPv4"));
                     }
 
-                    // If the non-IPv4 endpoint gave us IPv4, then we can't get an IPv6. We don't even need to try.
+                    // Otherwise, we can just log and continue.
                     log::debug!("Found current IPv6 address: none.");
                 }
             },
@@ -160,9 +170,20 @@ impl App {
 
                 if self.ipv4_enabled {
                     log::debug!("Pinging again for IPv4 address...");
-                    let addr = self.client.ping_v4().await?;
-                    log::debug!("Found current IPv4 address: {addr}");
-                    ipv4 = Some(addr);
+                    match self.client.ping_v4().await {
+                        Ok(addr) => {
+                            log::debug!("Found current IPv4 address: {addr}");
+                            ipv4 = Some(addr);
+                        },
+                        // Failing to fetch an IPv4 address is an error either if (a) IPv4 is required or (b) IPv4 is
+                        // the only one enabled.
+                        Err(e) if self.ipv4_required || !self.ipv6_enabled => {
+                            // I don't actually know what happens when you ping Porkbun from somewhere without an IPv4
+                            // address. Is that even possible yet? Has anywhere actually fully gotten rid of IPv4?
+                            return Err(e.wrap_err("Tried to get IPv4 address from Porkbun API, but only got IPv6"))?;
+                        },
+                        Err(_) => log::debug!("Found current IPv4 address: none."),
+                    }
                 }
             },
         }
@@ -234,7 +255,7 @@ impl App {
                     let tasks = addrs.into_iter().filter_map(move |addr| {
                         addr.map(async move |addr| -> Result<(), ()> {
                             let res = self.handle_target(target, records, addr).await;
-                            res.map_err(|err| log::error!("{target}: {err:#}")) // log error while mapping to ()
+                            res.map_err(|err| log::error!("{target}: {err:#}")) // log and map to () at the same time
                         })
                     });
 
