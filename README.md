@@ -37,7 +37,7 @@ targets = [
   { domain = "example.com", subdomain = "foo" },
 
   # The default TTL is 600, but it can be overridden:
-  { domain = "example.com", ttl = 3600 }
+  { domain = "example.com", ttl = 3600 },
 
   # When specifying subdomains, "@" or "" may be used to refer to the root domain:
   { domain = "example.com", subdomain = "@", ttl = 1200 },
