@@ -13,17 +13,17 @@ clap = { version = "4.5.49", features = ["derive", "cargo", "env", "wrap_help"] 
 dotenvy = { version = "0.15.7", optional = true }
 eyre = "0.6.12"
 futures = "0.3.31"
-log = { version = "0.4.28", features = ["std", "kv"] }
+log = { version = "0.4.28", features = ["std"] }
 reqwest = { version = "0.12.23", features = ["blocking", "json"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
-tokio = { version = "1.47.1", features = ["full"] }
+tokio = { version = "1.47.1", features = ["rt", "fs", "macros"] }
 toml = "0.9.8"
 
 [target.'cfg(unix)'.dependencies]
 systemd-journal-logger = { version = "2.2.2", optional = true }
 
 [features]
-default = ["dotenv", "journald"]
+default = ["journald"]
 dotenv = ["dep:dotenvy"]
 journald = ["dep:systemd-journal-logger"]

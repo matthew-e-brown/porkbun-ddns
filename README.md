@@ -19,5 +19,5 @@ dedicated unit file and service user.
 ### Later todo
 
 - [ ] Document TOML configuration file in `--help`
-- [ ] Configure `tokio` features to only include the ones we need
+- [x] Configure `tokio` features to only include the ones we need
 - [ ] Evaluate binary size, configure build optimization flags if needed

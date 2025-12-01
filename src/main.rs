@@ -20,7 +20,7 @@ macro_rules! pluralize {
     };
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 pub async fn main() -> ExitCode {
     let app = match App::init().await {
         Ok(app) => app,
@@ -238,13 +238,13 @@ impl App {
                         })
                     });
 
-                    // Return an `Iterator<impl Future>` to the outer `filter_map`, giving `Iter<Iter<impl
-                    // Future>>`, which then gets flattened down into one final iterator of futures.
+                    // Return an `Iterator<impl Future>` to the outer `filter_map`, giving `Iter<Iter<impl Future>>`,
+                    // which then gets flattened down into one final iterator of futures.
                     Some(tasks)
                 },
                 _ => {
-                    // Target's records might be missing if we previously failed to fetch them. Error would've
-                    // already been logged in that case, so we don't need to report another one.
+                    // Target's records might be missing if we previously failed to fetch them. Error would've already
+                    // been logged in that case, so we don't need to report another one.
                     log::warn!("{target}: Skipped due to missing DNS records.");
                     // Skip over this target in the outer `filter_map`.
                     return None;
