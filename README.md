@@ -52,11 +52,5 @@ targets = [
 The `domain` value should match the domain name as it appears in Porkbun's
 dashboard. Specifying targets with subdomains must be done using the table
 syntax, since there is no (simple) way to determine where to split the main
-domain and subdomain in the general case (e.g., consider
+domain and subdomain in the general case (e.g., consider 
 `sub2.sub1.example.co.uk`).
-
-<!-- ----------------------------------------------------------------------- -->
-
-## Todo
-
-- Write systemd `.timer` and `.service` units

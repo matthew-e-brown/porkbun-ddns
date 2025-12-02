@@ -1,0 +1,15 @@
+# Example Service file for porkbun-ddns.
+
+[Unit]
+Description=Porkbun Dynamic DNS client
+Requisite=network-online.target
+After=network-online.target
+
+[Service]
+Type=exec
+ExecStart=/usr/bin/porkbun-ddns
+Environment="PORKBUN_CONFIG_PATH=/etc/porkbun-ddns/ddns.toml"
+Environment="PORKBUN_LOG_LEVEL=debug"
+EnvironmentFile=/etc/porkbun-ddns/env
+ProtectSystem=strict
+PrivateDevices=true

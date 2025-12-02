@@ -1,0 +1,13 @@
+# Example Timer file for porkbun-ddns.
+
+[Unit]
+Description=Update Porkbun DNS records automatically
+
+[Timer]
+# Run every 15 minutes.
+OnCalendar=*:0/15:00
+# When the timer is activated, run immediately if the last time was missed.
+Persistent=true
+
+[Install]
+WantedBy=timers.target
