@@ -14,7 +14,7 @@ use crate::api::DNSRecord;
 #[command(version, about, max_term_width = 100)]
 pub struct Args {
     /// Path to TOML file containing configuration for the domains to update.
-    #[arg(short, long, env = "PORKBUN_DDNS_CONFIG", value_name = "FILE")]
+    #[arg(short, long, env = "PORKBUN_CONFIG_PATH", value_name = "FILE")]
     #[cfg_attr(unix, arg(default_value = "/etc/porkbun-ddns/ddns.toml"))]
     pub config: PathBuf,
 
